@@ -19,7 +19,7 @@ logging.basicConfig(
 
 # --- Configuración y Almacenamiento de Datos ---
 # NOTA: Cambia este token por el real si lo vas a ejecutar
-TOKEN = "8457617126:AAEVp3M__tK0GmspiucKDT1zaK77MNMCQ-g"  
+TOKEN = "8457617126:AAFtla_bwdiw78zpH70z8W8sS9ICBFK3YFU"  
 
 # 🚨 ID del Administrador FIJA
 ADMIN_ID = 7006777962 
