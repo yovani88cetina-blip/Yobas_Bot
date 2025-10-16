@@ -1,4 +1,4 @@
-﻿from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, ContextTypes,
     CommandHandler, ConversationHandler, MessageHandler, filters
@@ -10,6 +10,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from types import SimpleNamespace
+from pathlib import Path
 
 # Configuración de logging
 logging.basicConfig(
@@ -34,6 +35,8 @@ clientes = {}
 tmp_venta = {} # Usado para /addventa
 tmp_reporte = {} # Usado para el flujo de Reporte
 ADMIN_USERNAME = "YobasAdmin" # Nombre de referencia
+ADMIN_PHONE = "9992779422"
+WELCOME_IMAGE = "welcome_bot.jpg"  # Coloca este archivo en el mismo directorio o cambia el nombre
 # Constante para la garantía
 GARANTIA_DIAS = 25 
 
@@ -41,6 +44,10 @@ GARANTIA_DIAS = 25
 AGREGAR_TIPO, AGREGAR_PERFILES, AGREGAR_CORREO, AGREGAR_PASS, AGREGAR_PRECIO = range(5)
 REPORTE_CORREO, REPORTE_PASS, REPORTE_FECHA, REPORTE_ID_COMPRA, REPORTE_DESCRIPCION = range(5, 10)
 AGREGAR_MATERIAL = 10
+
+# Estados para el flujo de combos
+ADD_COMBO_TITULO, ADD_COMBO_SUBNOMBRE, ADD_COMBO_PRECIO, ADD_COMBO_PLATAFORMAS = range(20, 24)
+combos = []
 
 
 # --- Funciones de Carga/Guardado del Administrador (Simplificadas) ---
@@ -311,17 +318,101 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Comandos Generales y Stock ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start - Muestra el menú principal."""
-    user_id = update.message.from_user.id
-    
-    inicializar_usuario(user_id)
-    
-    if is_admin(user_id):
-        welcome_msg="👑 Bienvenido, Administrador. Usa /comandos para ver tus opciones."
+    """/start - Muestra la imagen de bienvenida con ID y luego el menú principal.
+    Muestra comandos según el rol."""
+    # Determinar usuario
+    if getattr(update, "message", None):
+        user = update.message.from_user
+    elif getattr(update, "callback_query", None):
+        user = update.callback_query.from_user
     else:
-        welcome_msg="👋 ¡Hola! Bienvenido a YobasStreamingBot."
-        
-    await show_main_menu(update, context, welcome_msg=welcome_msg)
+        user = update.effective_user
+    if not user:
+        return
+
+    user_mention = f"@{user.username}" if getattr(user, "username", None) else (user.first_name or "Usuario")
+    user_id = user.id
+    inicializar_usuario(user_id)
+
+    # Definir textos de comandos aquí para usarlos en la bienvenida
+    admin_comandos = (
+        "👑 *Comandos de Administrador:*\n"
+        "/start - Iniciar el bot y ver el menú principal.\n"
+        "/saldo - Ver tu saldo.\n"
+        "/comandos - Muestra esta lista.\n"
+        "/stock - Ver el inventario detallado de cuentas.\n"
+        "/addventa <Plataforma> - Agregar cuenta al stock.\n"
+        "/borrarventa - Eliminar cuenta del stock.\n"
+        "/recargar <ID> <monto> - Recarga saldo a un usuario.\n"
+        "/quitarsaldo <ID> <monto> - Descuenta saldo a un usuario.\n"
+        "/consultarsaldo <ID> - Consulta saldo de un usuario.\n"
+        "/historial - Obtén el CSV de tu historial de compras.\n"
+        "/cancel - Cancela un flujo de conversación.\n"
+        "/addcombo - Inicia flujo para agregar combos.\n"
+        "/combos - Muestra combos disponibles.\n"
+        "/verclientes - Muestra lista de clientes.\n"
+        "/responder <ID> <mensaje> - Enviar mensaje a cliente.\n"
+    )
+    cliente_comandos = (
+        "👤 *Comandos de Cliente:*\n"
+        "/start - Iniciar el bot y ver el menú principal.\n"
+        "/saldo - Ver tu saldo actual.\n"
+        "/comandos - Muestra esta lista.\n"
+        "/historial - Descarga tu historial de compras.\n"
+        "/cancel - Cancela un flujo de conversación (si está activo).\n"
+        "/combos - Muestra los combos disponibles.\n"
+        "⚠️ Reportar problema desde el menú principal.\n"
+    )
+
+    if is_admin(user_id):
+        comandos_text = f"{admin_comandos}\n{cliente_comandos}"
+    else:
+        comandos_text = cliente_comandos
+
+    bienvenida_text = (
+        f"¡Bienvenido {user_mention}!\n\n"
+        f"Tu ID es: {user_id}\n\n"
+        "Si ya cuentas con créditos, estos comandos son para ti:\n\n"
+        f"{comandos_text}\n"
+        f"Para comprar créditos, contacta al administrador {ADMIN_USERNAME} {f'({ADMIN_PHONE})' if ADMIN_PHONE else ''}"
+    )
+
+    # Resolver ruta absoluta de la imagen (misma carpeta del script)
+    script_dir = Path(__file__).resolve().parent
+    image_path = script_dir / WELCOME_IMAGE
+
+    logging.info(f"Start: buscando imagen de bienvenida en: {image_path}")
+    try:
+        if WELCOME_IMAGE and image_path.exists():
+            file_size = image_path.stat().st_size
+            logging.info(f"Start: imagen encontrada (tamaño {file_size} bytes). Intentando enviar como photo...")
+            with open(image_path, "rb") as img:
+                try:
+                    # Intento principal: enviar como photo
+                    if getattr(update, "message", None):
+                        await update.message.reply_photo(photo=img, caption=bienvenida_text, parse_mode="Markdown")
+                    else:
+                        await context.bot.send_photo(chat_id=user_id, photo=img, caption=bienvenida_text, parse_mode="Markdown")
+                except Exception as e_photo:
+                    logging.warning(f"Fallo send_photo: {e_photo}. Intentando enviar como documento...")
+                    # Reabrir el archivo y enviar como documento (fall back)
+                    with open(image_path, "rb") as doc:
+                        if getattr(update, "message", None):
+                            await update.message.reply_document(document=doc, caption=bienvenida_text, parse_mode="Markdown")
+                        else:
+                            await context.bot.send_document(chat_id=user_id, document=doc, caption=bienvenida_text, parse_mode="Markdown")
+        else:
+            logging.warning(f"Start: imagen no encontrada en {image_path} (WELCOME_IMAGE='{WELCOME_IMAGE}')")
+            if getattr(update, "message", None):
+                await update.message.reply_text(bienvenida_text, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=user_id, text=bienvenida_text, parse_mode="Markdown")
+    except Exception as e:
+        logging.exception(f"No se pudo enviar la imagen/texto de bienvenida: {e}")
+        # Último recurso: enviar sólo texto
+        await context.bot.send_message(chat_id=user_id, text=bienvenida_text, parse_mode="Markdown")
+
+    await show_main_menu(update, context, welcome_msg="✅ ¿Qué deseas hacer ahora?")
 
 
 async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,35 +536,40 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/comandos - Muestra los comandos disponibles según el rol del usuario."""
     user_id = update.message.from_user.id
     
+    admin_comandos = (
+        "👑 *Comandos de Administrador:*\n"
+        "------------------------------------\n"
+        "/start - Iniciar el bot y ver el menú principal.\n"
+        "/saldo - Ver tu saldo.\n"
+        "/comandos - Muestra esta lista.\n"
+        "/stock - Ver el inventario detallado de cuentas.\n"
+        "/addventa <Plataforma> - Inicia el flujo para agregar una cuenta al stock.\n"
+        "/borrarventa - Inicia el flujo para eliminar una cuenta del stock.\n"
+        "/recargar <ID> <monto> - Recarga saldo a un usuario.\n"
+        "/quitarsaldo <ID> <monto> - Descuenta saldo a un usuario.\n"
+        "/consultarsaldo <ID> - Consulta el saldo de un usuario específico.\n"
+        "/historial - Obtén el CSV de tu historial de compras.\n"
+        "/cancel - Cancela un flujo de conversación (e.g., /addventa, /borrarventa o Reporte).\n"
+        "/addcombo - Inicia el flujo para agregar un nuevo combo de cuentas.\n"
+        "/combos - Muestra los combos disponibles para compra.\n"
+        "/verclientes - Muestra la lista de clientes con su ID y saldo.\n"
+        "/responder <ID> <mensaje> - Responde a reportes o envía mensajes a clientes.\n"
+    )
+    cliente_comandos = (
+        "👤 *Comandos de Cliente:*\n"
+        "------------------------------------\n"
+        "/start - Iniciar el bot y ver el menú principal.\n"
+        "/saldo - Ver tu saldo actual.\n"
+        "/comandos - Muestra esta lista.\n"
+        "/historial - Obtén el CSV con el historial de tus compras.\n"
+        "/cancel - Cancela un flujo de conversación (si está activo).\n"
+        "/combos - Muestra los combos disponibles para compra.\n"
+        "⚠️ Reportar problema desde el menú principal.\n"
+    )
     if is_admin(user_id):
-        # Comandos para el Administrador
-        mensaje = (
-            "👑 Comandos de Administrador:\n"
-            "------------------------------------\n"
-            "/start - Iniciar el bot y ver el menú principal.\n"
-            "/saldo - Ver tu saldo.\n"
-            "/comandos - Muestra esta lista.\n"
-            "/stock - Ver el inventario detallado de cuentas.\n"
-            "/addventa <Plataforma> - Inicia el flujo para agregar una cuenta al stock.\n"
-            "/borrarventa - Inicia el flujo para eliminar una cuenta del stock.\n"
-            "/recargar <ID> <monto> - Recarga saldo a un usuario.\n"
-            "/quitarsaldo <ID> <monto> - Descuenta saldo a un usuario.\n"
-            "/consultarsaldo <ID> - Consulta el saldo de un usuario específico.\n"
-            "/historial - Obtén el CSV de tu historial de compras.\n"
-            "/cancel - Cancela un flujo de conversación (e.g., /addventa, /borrarventa o Reporte).\n"
-        )
+        mensaje = f"{admin_comandos}\n\n{cliente_comandos}"
     else:
-        # Comandos para el Cliente
-        mensaje = (
-            "👤 Comandos de Cliente:\n"
-            "------------------------------------\n"
-            "/start - Iniciar el bot y ver el menú principal.\n"
-            "/saldo - Ver tu saldo actual.\n"
-            "/comandos - Muestra esta lista.\n"
-            "/historial - Obtén el CSV con el historial de tus compras.\n"
-            "/cancel - Cancela un flujo de conversación (si está activo).\n"
-        )
-    
+        mensaje = cliente_comandos
     await update.message.reply_text(mensaje, parse_mode="Markdown")
 
 async def stock_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,11 +653,13 @@ async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     historial_file = f'historial_{user_id}.csv'
     
     if os.path.exists(historial_file) and os.path.getsize(historial_file) > 0:
-        await update.message.reply_document(
-            document=open(historial_file, 'rb'),
-            filename=f"historial_compras_{user_id}.csv",
-            caption="📂 Aquí tienes el historial de todas tus compras."
-        )
+        # Usar with para cerrar el archivo correctamente
+        with open(historial_file, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"historial_compras_{user_id}.csv",
+                caption="📂 Aquí tienes el historial de todas tus compras."
+            )
     else:
         await update.message.reply_text("❌ Aún no tienes compras registradas en tu historial.")
 
@@ -989,6 +1087,8 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     log_compra(user_id, plan_entregado, correo, password, precio_final, id_compra)
 
     # 4. Enviar cuenta al usuario (NUEVO MENSAJE)
+    logging.info(f"Entrega preparada: cuenta_data={cuenta_data}, user_id={user_id}, precio={precio_final:.2f}, saldo_restante={clientes[user_id]:.2f}, id_compra={id_compra}")
+
     mensaje_entrega = (
         "🎉 ¡Tu cuenta ha sido entregada! 🎉\n"
         "--------------------------------------\n"
@@ -1003,21 +1103,35 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🆔 ID de Compra: {id_compra}\n"
         "Guarda este ID para cualquier reporte. ¡Disfruta!\n"
     )
-    
-    # Enviar la cuenta
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=mensaje_entrega,
-        parse_mode="Markdown"
-    )
-    
-    material_filename = f"material_{correo}_perfil{perfil_entregado}.jpg" # o .pdf, .png, etc.
-    if os.path.exists(material_filename):
-        await context.bot.send_document(
+
+    # Intentar enviar el mensaje principal con manejo de errores
+    try:
+        await context.bot.send_message(
             chat_id=user_id,
-            document=open(material_filename, 'rb'),
-            caption=f"Material para tu Perfil {perfil_entregado}"
+            text=mensaje_entrega,
+            parse_mode="Markdown"
         )
+    except Exception as e:
+        logging.exception(f"Error enviando mensaje de entrega al usuario {user_id}: {e}")
+        # Notificar al admin por si falla el envío al cliente
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Error enviando entrega a {user_id}: {e}")
+        except Exception:
+            logging.exception("No se pudo notificar al admin sobre el fallo de entrega.")
+
+    # Envío de material adjunto (si existe) — usar with y captura de errores
+    material_filename = f"material_{correo}_perfil{perfil_entregado}.jpg"  # o .pdf, .png, etc.
+    if os.path.exists(material_filename):
+        try:
+            with open(material_filename, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=f,
+                    caption=f"Material para tu Perfil {perfil_entregado}"
+                )
+        except Exception as e:
+            logging.exception(f"No se pudo enviar material '{material_filename}' a {user_id}: {e}")
+            # No abortar; la compra ya está registrada
 
     # 5. Abrir automáticamente el menú principal (NUEVO MENSAJE)
     await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
@@ -1026,8 +1140,6 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- Funciones de Menú y Redirección ---
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, welcome_msg="Elige una opción:"):
-    """Genera el menú principal con botones dinámicos."""
-    # obtener user_id de manera segura (callback o message)
     user = update.effective_user
     if not user:
         return
@@ -1036,9 +1148,10 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, wel
     
     keyboard = [
         [InlineKeyboardButton("🛒 Comprar cuentas", callback_data="show_categories")], 
+        [InlineKeyboardButton("🎁 Combos disponibles", callback_data="show_combos_menu")],  # Nuevo botón
         [InlineKeyboardButton("💰 Recargar saldo", callback_data="mostrar_recarga")],
         [InlineKeyboardButton("⚠️ Reportar problema", callback_data="iniciar_reporte")],
-        [InlineKeyboardButton(f"💳 Saldo actual: ${clientes[user_id]:.2f}", callback_data="saldo_info")]
+        [InlineKeyboardButton(f"💳 Saldo current: ${clientes[user_id]:.2f}", callback_data="saldo_info")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1072,6 +1185,10 @@ async def show_recarga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=back_keyboard,
         parse_mode="Markdown"
     )
+
+# Nueva configuración de contacto / bienvenida (coloca aquí tu número e imagen)
+ADMIN_PHONE = ""  # Ej: "+52 844 212 5550"  <- Rellena con tu número
+WELCOME_IMAGE = "welcome_bot.jpg"  # Nombre del archivo de la imagen de bienvenida (colócala en el mismo directorio)
 
 # --- Lógica de Validación de ID de Compra ---
 def validar_id_compra(user_id: int, id_compra: str) -> bool:
@@ -1224,7 +1341,7 @@ async def reporte_descripcion_recibida(update: Update, context: ContextTypes.DEF
                 parse_mode="Markdown"
             )
         await update.message.reply_text(
-            "✅ Reporte enviado al administrador. Nos pondremos en contacto contigo pronto.",
+            "✅ Reporte enviado al administrador. Nos pongamos en contacto contigo pronto.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
         )
     except Exception as e:
@@ -1239,7 +1356,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /responder <ID_USUARIO> <mensaje>
     Permite al administrador enviar un mensaje directo a un cliente.
     """
-    user_id = update.message.from_user.id
+    try:
+        user_id = update.message.from_user.id
+    except Exception:
+        logging.error("responder: update.message no tiene from_user")
+        return
+
     if not is_admin(user_id):
         await update.message.reply_text("❌ Solo el administrador puede usar este comando.")
         return
@@ -1250,18 +1372,22 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         target_id = int(context.args[0])
-        mensaje = " ".join(context.args[1:])
-        if not mensaje.strip():
+        mensaje = " ".join(context.args[1:]).strip()
+        if not mensaje:
             await update.message.reply_text("❌ El mensaje no puede estar vacío.")
             return
 
+        logging.info(f"Administrador {user_id} enviando mensaje a {target_id}: {mensaje[:100]}")
         await context.bot.send_message(
             chat_id=target_id,
             text=f"📩 Mensaje del administrador:\n\n{mensaje}",
             parse_mode="Markdown"
         )
         await update.message.reply_text(f"✅ Mensaje enviado a {target_id}.")
+    except ValueError:
+        await update.message.reply_text("❌ ID de usuario inválido. Debe ser un número entero.")
     except Exception as e:
+        logging.exception(f"Error al enviar mensaje con /responder: {e}")
         await update.message.reply_text(f"❌ Error al enviar el mensaje: {e}")
 
 
@@ -1330,10 +1456,118 @@ async def guardar_material_perfil(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+# --- Flujo para agregar combos (solo Admin) ---
+
+async def addcombo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Solo el administrador puede agregar combos.")
+        return ConversationHandler.END
+    context.user_data['nuevo_combo'] = {}
+    await update.message.reply_text("📝 Escribe el nombre principal del combo (título):")
+    return ADD_COMBO_TITULO
+
+async def addcombo_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['nuevo_combo']['titulo'] = update.message.text.strip()
+    await update.message.reply_text("✏️ Escribe el subnombre del combo (descripción corta):")
+    return ADD_COMBO_SUBNOMBRE
+
+async def addcombo_subnombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['nuevo_combo']['subnombre'] = update.message.text.strip()
+    await update.message.reply_text("💲 Escribe el precio del combo:")
+    return ADD_COMBO_PRECIO
+
+async def addcombo_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        precio = float(update.message.text.strip().replace(',', '.'))
+        if precio <= 0:
+            raise ValueError
+        context.user_data['nuevo_combo']['precio'] = precio
+        context.user_data['nuevo_combo']['plataformas'] = []
+        await update.message.reply_text("📺 Escribe la primera plataforma incluida en el combo. Escribe 'listo' cuando termines de agregar plataformas.")
+        return ADD_COMBO_PLATAFORMAS
+    except ValueError:
+        await update.message.reply_text("❌ El precio debe ser un número positivo. Intenta nuevamente:")
+        return ADD_COMBO_PRECIO
+
+async def addcombo_plataformas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    if texto.lower() == 'listo':
+        combo = context.user_data['nuevo_combo']
+        combos.append(combo)
+        await update.message.reply_text(
+            f"✅ Combo creado:\n*{combo['titulo']}* ({combo['subnombre']})\nPrecio: ${combo['precio']:.2f}\nPlataformas: {', '.join(combo['plataformas'])}",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    else:
+        context.user_data['nuevo_combo']['plataformas'].append(texto)
+        await update.message.reply_text("Agrega otra plataforma o escribe 'listo' para terminar:")
+
+# Handler para mostrar combos en el menú principal
+async def show_combos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    mensaje = "🎁 *Combos disponibles:*\n\n"
+    for i, combo in enumerate(combos):
+        mensaje += f"{i+1}. *{combo['titulo']}* ({combo['subnombre']}) - ${combo['precio']:.2f}\n"
+        mensaje += "   Plataformas: " + ", ".join(combo['plataformas']) + "\n"
+        keyboard.append([InlineKeyboardButton(f"Comprar {combo['titulo']}", callback_data=f"comprar_combo_{i}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="empezar")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Si viene de CallbackQuery, usar edit_message_text; si no, reply_text
+    if getattr(update, "callback_query", None):
+        query = update.callback_query
+        # Responder al callback para quitar la "carga" en el cliente
+        try:
+            await query.answer()
+        except Exception as e:
+            # Ignorar callbacks expirados / inválidos; loguear en debug
+            logging.debug(f"Ignored query.answer() error: {e}")
+        # Intentar editar el mensaje original; si falla, enviar uno nuevo
+        try:
+            await query.edit_message_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(chat_id=query.from_user.id, text=mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+
+async def ver_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/verclientes - Muestra la lista de clientes con su ID y saldo (solo Admin)."""
+    user_id = update.message.from_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Solo el administrador puede usar este comando.")
+        return
+
+    if not clientes:
+        await update.message.reply_text("No hay clientes registrados.")
+        return
+
+    mensaje = "🗂️ *Lista de clientes:*\n\n"
+    for cid, saldo in clientes.items():
+        mensaje += f"ID: `{cid}` | Saldo: ${saldo:.2f}\n"
+    await update.message.reply_text(mensaje, parse_mode="Markdown")
+
 def main():
     """Configuración principal del bot."""
     cargar_clientes()
     application = ApplicationBuilder().token(TOKEN).build()
+
+    # Handler para agregar combos
+    addcombo_handler = ConversationHandler(
+    entry_points=[CommandHandler('addcombo', addcombo_start)],
+    states={
+        ADD_COMBO_TITULO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_titulo)],
+        ADD_COMBO_SUBNOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_subnombre)],
+        ADD_COMBO_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_precio)],
+        ADD_COMBO_PLATAFORMAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_plataformas)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+    application.add_handler(addcombo_handler)
+    application.add_handler(CallbackQueryHandler(show_combos_menu, pattern='^show_combos_menu$'))
+    application.add_handler(CommandHandler("combos", show_combos_menu))
+    application.add_handler(CommandHandler("verclientes", ver_clientes))
 
     # Comandos generales
     application.add_handler(CommandHandler("start", start))
@@ -1347,7 +1581,8 @@ def main():
     application.add_handler(CommandHandler("recargar", recargar))
     application.add_handler(CommandHandler("quitarsaldo", quitar_saldo))
     application.add_handler(CommandHandler("consultarsaldo", consultar_saldo))
-    
+    application.add_handler(CommandHandler("responder", responder))  # <-- AÑADIR AQUÍ
+
     # Flujo de agregar venta (Admin)
     addventa_handler = ConversationHandler(
         entry_points=[CommandHandler('addventa', addventa)],
@@ -1382,6 +1617,10 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_platform_selection, pattern='^select_(completa|perfil)_.*')) 
     application.add_handler(CallbackQueryHandler(handle_compra_final, pattern='^buy_.*')) 
     
+    # Handlers de Combos
+    application.add_handler(CommandHandler("addcombo", addcombo_start))
+    application.add_handler(CommandHandler("combos", show_combos_menu))
+    
     # Handlers Varios
     application.add_handler(CallbackQueryHandler(show_main_menu, pattern='^empezar$'))
     application.add_handler(CallbackQueryHandler(show_categories, pattern='^comprar$')) # Redirige el viejo 'comprar' al nuevo menú de categorías
@@ -1393,6 +1632,90 @@ def main():
     application.add_handler(CallbackQueryHandler(mostrar_lista_borrar, pattern='^borrar_(completa|perfil|otro)$'))
     application.add_handler(MessageHandler(filters.TEXT & filters.Chat(ADMIN_ID), borrar_stock_por_indice)) 
     application.add_handler(MessageHandler(filters.PHOTO & filters.Chat(ADMIN_ID), responder_foto))
+
+    # Nuevo handler para la compra de combos
+    async def handle_combo_compra(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+        inicializar_usuario(user_id)
+
+        try:
+            index = int(query.data.split('_')[-1])
+        except Exception as e:
+            logging.exception(f"handle_combo_compra: índice inválido en callback_data '{query.data}': {e}")
+            await query.edit_message_text("❌ Error interno. Intenta de nuevo.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]))
+            return
+
+        if index < 0 or index >= len(combos):
+            await query.edit_message_text("❌ Combo no encontrado.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]))
+            return
+
+        combo = combos[index]
+        precio = float(combo.get('precio', 0.0))
+
+        if clientes[user_id] < precio:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Saldo insuficiente. Necesitas ${precio:.2f} y solo tienes ${clientes[user_id]:.2f}.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Recargar saldo", callback_data="mostrar_recarga")], [InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]),
+                parse_mode="Markdown"
+            )
+            return
+
+        # Descontar y registrar la compra
+        clientes[user_id] -= precio
+        guardar_clientes()
+        id_compra = str(uuid.uuid4()).split('-')[0].upper()
+        log_compra(user_id, combo.get('titulo', 'Combo'), "N/A", "N/A", precio, id_compra)
+
+        logging.info(f"Entrega combo preparada: combo_index={index}, user_id={user_id}, precio={precio:.2f}, saldo_restante={clientes[user_id]:.2f}, id_compra={id_compra}")
+
+        mensaje_entrega = (
+            "🎉 ¡Tu combo ha sido entregado! 🎉\n"
+            "--------------------------------------\n"
+            f"➡️ Combo: {combo.get('titulo','N/A')}\n"
+            f"➡️ Descripción: {combo.get('subnombre','')}\n"
+            f"➡️ Plataformas: {', '.join(combo.get('plataformas', []))}\n"
+            f"➡️ Costo: ${precio:.2f}\n"
+            "--------------------------------------\n"
+            f"🛡️ Garantía: {GARANTIA_DIAS} días\n"
+            f"🆔 ID de Compra: {id_compra}\n"
+            "Guarda este ID para cualquier reporte. ¡Disfruta!\n"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=mensaje_entrega,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.exception(f"Error enviando mensaje de entrega al usuario {user_id}: {e}")
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Error enviando entrega de combo a {user_id}: {e}")
+            except Exception:
+                logging.exception("No se pudo notificar al admin sobre el fallo de entrega de combo.")
+
+        # Envío de material adjunto por plataforma (si existe)
+        for plataforma in combo.get('plataformas', []):
+            # Nombre de material específico para combos (no usar variables de compra individual)
+            material_filename = f"material_{plataforma}_combo.jpg"
+            if os.path.exists(material_filename):
+                try:
+                    with open(material_filename, 'rb') as mf:
+                        await context.bot.send_document(
+                            chat_id=user_id,
+                            document=mf,
+                            caption=f"Material para {plataforma} en tu combo"
+                        )
+                except Exception as e:
+                    logging.exception(f"No se pudo enviar material '{material_filename}' a {user_id}: {e}")
+                    # continuar con otras plataformas
+
+        await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
+
+    application.add_handler(CallbackQueryHandler(handle_combo_compra, pattern='^comprar_combo_\\d+$'))
 
     application.run_polling()
 
