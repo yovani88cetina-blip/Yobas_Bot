@@ -5,12 +5,14 @@ from telegram.ext import (
 )
 import csv
 import logging
-import os
+import os 
 import uuid
 from collections import defaultdict
 from datetime import datetime
 from types import SimpleNamespace
 from pathlib import Path
+from telegram.error import BadRequest
+import re  # ya importado en el archivo; si no, esta línea es segura
 
 # Configuración de logging
 logging.basicConfig(
@@ -20,7 +22,9 @@ logging.basicConfig(
 
 # --- Configuración y Almacenamiento de Datos ---
 # NOTA: Cambia este token por el real si lo vas a ejecutar
-TOKEN = "8457617126:AAFtla_bwdiw78zpH70z8W8sS9ICBFK3YFU"  
+TOKEN = "8457617126:AAEkkALVR7eHegeuoDYXElWS54msmaBM5ok"  # Reemplaza con tu token real de Telegram
+if not TOKEN:
+    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno")
 
 # 🚨 ID del Administrador FIJA
 ADMIN_ID = 7006777962 
@@ -29,13 +33,20 @@ ADMIN_ID = 7006777962
 CSV_CLIENTES = 'clientes.csv'
 STOCK_FILE = 'stock.csv'
 COMPRAS_FILE = 'compras_global.csv' 
+# Cambiado para persistir combos en CSV compatible con Excel
+COMBOS_FILE = 'combos.csv'
+# Añade estas variables de configuración (edítalas con tus datos)
+ADMIN_WHATSAPP = "+529992779422"  # Ej: "+52 844 212 5550" — coloca tu número de WhatsApp aquí
+BANK_ACCOUNT = "722969020048622836 💰 Stp / Mercado Pago 👤 Yobas Vnts"    # Ej: "Banco XYZ - CLABE: 012345678901234567" — coloca los datos bancarios aquí
+MIN_RECARGA = 50.0   # Mínimo de recarga en pesos
+
 
 # Variables globales para el estado
 clientes = {}
 tmp_venta = {} # Usado para /addventa
 tmp_reporte = {} # Usado para el flujo de Reporte
 ADMIN_USERNAME = "YobasAdmin" # Nombre de referencia
-ADMIN_PHONE = "9992779422"
+ADMIN_PHONE = ""  # Configura aquí tu número, ej: "+52 844 212 5550"
 WELCOME_IMAGE = "welcome_bot.jpg"  # Coloca este archivo en el mismo directorio o cambia el nombre
 # Constante para la garantía
 GARANTIA_DIAS = 25 
@@ -61,6 +72,7 @@ def is_admin(user_id):
 def cargar_clientes():
     """Carga los saldos de los clientes desde el archivo CSV."""
     global clientes
+    clientes = {}  # Reinicia para evitar acumulaciones
     try:
         with open(CSV_CLIENTES, 'r') as f:
             reader = csv.reader(f)
@@ -93,6 +105,51 @@ def inicializar_usuario(user_id):
 
 # --- Lógica de Stock y Precios Dinámicos ---
 
+def save_combos_csv():
+    """Guarda la lista `combos` en `COMBOS_FILE` (CSV). Plataformas separadas por '|'."""
+    try:
+        with open(COMBOS_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Cabecera para que Excel lo abra bien
+            writer.writerow(['titulo', 'subnombre', 'precio', 'plataformas'])
+            for c in combos:
+                titulo = c.get('titulo', '')
+                sub = c.get('subnombre', '')
+                precio = float(c.get('precio', 0.0))
+                plataformas = c.get('plataformas', []) or []
+                # Reemplazar '|' dentro de nombres por espacio para evitar colisiones
+                plataformas_str = '|'.join([p.replace('|', ' ') for p in plataformas])
+                writer.writerow([titulo, sub, f"{precio:.2f}", plataformas_str])
+    except Exception as e:
+        logging.exception(f"Error guardando {COMBOS_FILE}: {e}")
+
+def load_combos_csv():
+    """Carga `combos` desde COMBOS_FILE si existe. Rellena la lista global `combos`."""
+    global combos
+    combos = []
+    try:
+        if not os.path.exists(COMBOS_FILE):
+            return
+        with open(COMBOS_FILE, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    titulo = (row.get('titulo') or '').strip()
+                    sub = (row.get('subnombre') or '').strip()
+                    precio = float((row.get('precio') or '0').strip() or 0)
+                    plataformas_str = (row.get('plataformas') or '').strip()
+                    plataformas = [p for p in plataformas_str.split('|') if p]
+                    combos.append({
+                        'titulo': titulo,
+                        'subnombre': sub,
+                        'precio': precio,
+                        'plataformas': plataformas
+                    })
+                except Exception as e:
+                    logging.exception(f"Fila combos inválida en {COMBOS_FILE}: {row} - {e}")
+    except Exception as e:
+        logging.exception(f"Error cargando {COMBOS_FILE}: {e}")
+
 def load_stock():
     """Carga todo el stock desde el archivo CSV, sin filtrar por número de campos.
     Devuelve una lista de filas (cada fila es una lista de strings)."""
@@ -119,6 +176,33 @@ def save_stock(stock_list):
         logging.info("Stock guardado después de la eliminación.")
     except Exception as e:
         logging.error(f"Error al guardar stock: {e}")
+
+def cleanup_stock():
+    """Limpia entradas de stock inválidas o con perfiles a 0 y guarda si hay cambios."""
+    cuentas = load_stock()
+    changed = False
+    cleaned = []
+    for row in cuentas:
+        if not row or len(row) < 5:
+            # ignorar filas malformadas
+            continue
+        # Si es registro con perfiles (>=7 campos), validar perfiles_disponibles
+        if len(row) >= 7:
+            try:
+                perfiles_disponibles = int(row[5])
+            except (ValueError, TypeError):
+                # fila corrupta -> eliminar
+                changed = True
+                continue
+            if perfiles_disponibles <= 0:
+                # eliminar fila si no tiene perfiles disponibles
+                changed = True
+                continue
+        # Caso normal: mantener fila
+        cleaned.append(row)
+    if changed:
+        save_stock(cleaned)
+    return cleaned
 
 def get_dynamic_stock_info():
     """
@@ -169,31 +253,66 @@ def get_dynamic_stock_info():
 # --- Flujo para agregar cuentas (Conversación de Admin) - CON VALIDACIONES ---
 
 async def addventa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/addventa - Punto de entrada para el flujo de adición de stock (solo Admin)."""
     user_id = update.message.from_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("❌ Solo el administrador puede agregar ventas.")
+        msg = "❌ Solo el administrador puede agregar ventas."
+        try:
+            await update.message.reply_text(msg)
+        except Exception:
+            logging.exception("addventa: fallo reply_text para no-admin")
+            try:
+                await context.bot.send_message(chat_id=user_id, text=msg)
+            except Exception:
+                logging.exception("addventa: fallo fallback send_message para no-admin")
         return ConversationHandler.END
 
     if not context.args:
-        await update.message.reply_text("❌ Uso: /addventa <nombre de la plataforma>\nEj: /addventa Netflix")
+        msg = "❌ Uso: /addventa <nombre de la plataforma>\nEj: /addventa Netflix"
+        try:
+            await update.message.reply_text(msg)
+        except Exception:
+            logging.exception("addventa: fallo reply_text en uso")
+            try:
+                await context.bot.send_message(chat_id=user_id, text=msg)
+            except Exception:
+                logging.exception("addventa: fallo fallback send_message en uso")
         return ConversationHandler.END
 
-    plataforma = " ".join(context.args).strip()
-    if not plataforma:
-        await update.message.reply_text("❌ El nombre de la plataforma no puede estar vacío.")
+    Plataforma = " ".join(context.args).strip()
+    if not Plataforma:
+        msg = "❌ El nombre de la plataforma no puede estar vacío."
+        try:
+            await update.message.reply_text(msg)
+        except Exception:
+            logging.exception("addventa: fallo reply_text plataforma vacía")
+            try:
+                await context.bot.send_message(chat_id=user_id, text=msg)
+            except Exception:
+                logging.exception("addventa: fallo fallback send_message plataforma vacía")
         return ConversationHandler.END
 
-    tmp_venta[user_id] = {"plataforma": plataforma}
-    await update.message.reply_text(
-        f"Añadiendo {plataforma}.\nResponde con el tipo de cuenta (Ej: 'Completa', 'Perfil 1'):",
-        parse_mode="Markdown"
-    )
+    tmp_venta[user_id] = {"Plataforma": Plataforma}
+    inicio_msg = f"Añadiendo {Plataforma}.\nResponde con el tipo de cuenta (Ej: 'Completa', 'Perfil 1'):"
+    try:
+        await update.message.reply_text(inicio_msg, parse_mode="Markdown")
+    except Exception:
+        logging.exception("addventa: fallo reply_text en inicio del flujo")
+        try:
+            await context.bot.send_message(chat_id=user_id, text=inicio_msg, parse_mode="Markdown")
+        except Exception:
+            logging.exception("addventa: fallo fallback send_message en inicio del flujo — abortando flujo")
+            return ConversationHandler.END
+
     return AGREGAR_TIPO
 
 async def venta_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Paso 1: Recibe y valida el tipo de cuenta (Completa/Perfil)."""
     user_id = update.message.from_user.id
+    # Validación: existe tmp_venta para este usuario?
+    if user_id not in tmp_venta:
+        await update.message.reply_text("❌ No hay ningún flujo de /addventa activo. Inicia con: /addventa <Plataforma>")
+        return ConversationHandler.END
+
     tipo = update.message.text.strip()
     if not tipo:
         await update.message.reply_text("❌ El tipo de cuenta no puede estar vacío. Intenta nuevamente:")
@@ -201,20 +320,84 @@ async def venta_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     tipo_lower = tipo.lower()
     
-    # Si contiene 'perfil' y NO 'completa', ir a preguntar perfiles (aunque ya esté especificado, por si acaso).
-    if 'perfil' in tipo_lower and 'completa' not in tipo_lower and 'perfil' not in tmp_venta[user_id].get('plataforma', '').lower():
+    # Si contiene 'perfil' y NO 'completa', ir a preguntar perfiles
+    if 'perfil' in tipo_lower and 'completa' not in tipo_lower and 'perfil' not in tmp_venta[user_id].get('Plataforma', '').lower():
         tmp_venta[user_id]['tipo_base'] = tipo
         await update.message.reply_text("¿Cuántos perfiles tiene esta cuenta (solo el número)?")
         return AGREGAR_PERFILES
     else:
-        # Es completa u otro tipo
         tmp_venta[user_id]['tipo'] = tipo
         await update.message.reply_text("Ingresa el correo de la cuenta:")
         return AGREGAR_CORREO
 
+async def recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/recargar <ID_USUARIO> <monto> (Admin) o Instrucciones (Usuario)."""
+    user_id = update.message.from_user.id
+
+    # Usuario normal -> instrucciones de recarga con WhatsApp, cuenta y su ID
+    if not is_admin(user_id):
+        inicializar_usuario(user_id)
+        back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+
+        whatsapp = ADMIN_WHATSAPP or "(no configurado)"
+        bank = BANK_ACCOUNT or "(no configurada)"
+        min_text = f"${MIN_RECARGA:.2f}"
+
+        texto = (
+            f"💰 Tu saldo actual es: ${clientes.get(user_id, 0):.2f}\n\n"
+            "Para recargar realiza una transferencia o depósito y envía el comprobante por WhatsApp.\n\n"
+            f"📲 WhatsApp (envía comprobante): {whatsapp}\n"
+            f"🏦 Cuenta / Referencia: {bank}\n\n"
+            f"🔎 Tu ID de cliente (indícalo en el comprobante/WhatsApp): `{user_id}`\n"
+            f"⚠️ Mínimo de recarga: {min_text} pesos.\n\n"
+            "Después de enviar el comprobante por WhatsApp con tu ID de cliente, procesaremos la recarga."
+        )
+
+        await update.message.reply_text(
+            texto,
+            reply_markup=back_keyboard,
+            parse_mode="Markdown"
+        )
+        return
+
+    # Lógica de simulación de recarga para el ADMIN
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text("❌ Uso Admin: /recargar <ID_USUARIO> <monto>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        monto = float(context.args[1])
+
+        if monto <= 0:
+            await update.message.reply_text("❌ El monto debe ser positivo.")
+            return
+
+        inicializar_usuario(target_id)
+        clientes[target_id] += monto
+        guardar_clientes()
+
+        await update.message.reply_text(f"✅ Recarga exitosa a ID {target_id} de ${monto:.2f}. Saldo actual: ${clientes[target_id]:.2f}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"🎉 Tu saldo ha sido recargado con ${monto:.2f} por el administrador. Saldo actual: ${clientes[target_id]:.2f}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            logging.warning(f"No se pudo enviar notificación al usuario {target_id}.")
+
+    except ValueError:
+        await update.message.reply_text("❌ ID de usuario o Monto inválido. Ambos deben ser números (el monto puede ser decimal).")
+
 async def venta_perfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Paso 1.5: Recibe el número de perfiles si se seleccionó 'Perfil'."""
     user_id = update.message.from_user.id
+    if user_id not in tmp_venta:
+        await update.message.reply_text("❌ No hay ningún flujo de /addventa activo. Inicia con: /addventa <Plataforma>")
+        return ConversationHandler.END
+
     try:
         num_perfiles = int(update.message.text.strip())
         if num_perfiles <= 0:
@@ -223,16 +406,60 @@ async def venta_perfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ingresa un número de perfiles válido (ej: 1, 4, 5).")
         return AGREGAR_PERFILES
     
-    # Construir el tipo final de cuenta
     base_tipo = tmp_venta[user_id].get('tipo_base', 'Perfil')
     tmp_venta[user_id]['tipo'] = f"{base_tipo} ({num_perfiles})"
     
     await update.message.reply_text("Ingresa el correo de la cuenta:")
     return AGREGAR_CORREO
 
+async def show_recarga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la información de recarga (WhatsApp, cuenta, ID del cliente y mínimo)."""
+    query = getattr(update, "callback_query", None)
+    # soportar llamadas tanto desde callback_query como desde message
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        user_id = query.from_user.id
+    else:
+        # fallback: si se llama por mensaje directo
+        user_id = update.effective_user.id if update.effective_user else (update.message.from_user.id if update.message else None)
+        if not user_id:
+            return
+
+    whatsapp = ADMIN_WHATSAPP or "(no configurado)"
+    bank = BANK_ACCOUNT or "(no configurada)"
+    min_text = f"${MIN_RECARGA:.2f}"
+
+    back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+
+    texto = (
+        f"💰 Tu saldo actual es: ${clientes.get(user_id, 0):.2f}\n\n"
+        "Para recargar realiza una transferencia o depósito y envía el comprobante por WhatsApp con tu ID de cliente.\n\n"
+        f"📲 WhatsApp (envía comprobante): {whatsapp}\n"
+        f"🏦 Cuenta / Referencia: {bank}\n\n"
+        f"🔎 Tu ID de cliente (indícalo en el comprobante/WhatsApp): `{user_id}`\n"
+        f"⚠️ Mínimo de recarga: {min_text} pesos.\n\n"
+        "Envía el comprobante al WhatsApp indicado junto con tu ID de cliente para que procesemos la recarga."
+    )
+
+    try:
+        if query:
+            await query.edit_message_text(texto, reply_markup=back_keyboard, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=back_keyboard, parse_mode="Markdown")
+    except Exception:
+        # fallback por si la edición falla
+        await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=back_keyboard, parse_mode="Markdown")
+
 async def venta_correo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Paso 2: Recibe y valida el correo."""
     user_id = update.message.from_user.id
+    if user_id not in tmp_venta:
+        await update.message.reply_text("❌ No hay ningún flujo de /addventa activo. Inicia con: /addventa <Plataforma>")
+        return ConversationHandler.END
+
     correo = update.message.text.strip()
     if not correo:
         await update.message.reply_text("❌ El correo de la cuenta no puede estar vacío. Intenta nuevamente:")
@@ -245,6 +472,10 @@ async def venta_correo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def venta_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Paso 3: Recibe y valida la contraseña."""
     user_id = update.message.from_user.id
+    if user_id not in tmp_venta:
+        await update.message.reply_text("❌ No hay ningún flujo de /addventa activo. Inicia con: /addventa <Plataforma>")
+        return ConversationHandler.END
+
     password = update.message.text.strip()
     if not password:
         await update.message.reply_text("❌ La contraseña no puede estar vacía. Intenta nuevamente:")
@@ -257,12 +488,16 @@ async def venta_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def venta_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Paso 4: Recibe y valida el precio. Guarda la cuenta en stock.csv."""
     user_id = update.message.from_user.id
+    if user_id not in tmp_venta:
+        await update.message.reply_text("❌ No hay ningún flujo de /addventa activo. Inicia con: /addventa <Plataforma>")
+        return ConversationHandler.END
+
     try:
         precio_text = update.message.text.strip().replace(',', '.')
         if not precio_text:
             await update.message.reply_text("❌ El precio no puede estar vacío. Intenta nuevamente:")
             return AGREGAR_PRECIO
-            
+
         precio = float(precio_text)
         if precio <= 0:
             await update.message.reply_text("❌ El precio debe ser positivo. Intenta nuevamente:")
@@ -285,16 +520,88 @@ async def venta_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         perfiles = 1
 
-    with open(STOCK_FILE, 'a', newline='') as f:
-        writer = csv.writer(f)
-        # Nuevo formato: plataforma, tipo, correo, pass, precio, perfiles_disponibles, perfil_actual
-        writer.writerow([data['plataforma'], tipo, data['correo'], data['pass'], f"{data['precio']:.2f}", perfiles, 1])
+    try:
+        with open(STOCK_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([data['Plataforma'], tipo, data['correo'], data['pass'], f"{data['precio']:.2f}", perfiles, 1])
+    except Exception as e:
+        logging.exception(f"Error escribiendo en {STOCK_FILE}: {e}")
+        await update.message.reply_text("❌ Error al guardar la cuenta en stock. Intenta de nuevo más tarde.")
+        return ConversationHandler.END
 
+    # Confirmación y fin del flujo (sin preguntar por material)
     await update.message.reply_text(
-        f"✅ Se añadió una cuenta de {data['plataforma']} ({tipo}) con {perfiles} perfiles disponibles, precio ${data['precio']:.2f} cada uno.",
+        f"✅ Se añadió una cuenta de {data['Plataforma']} ({tipo}) con {perfiles} perfil(es) disponibles. Precio: ${data['precio']:.2f}.\n\nRegistro completado.",
         parse_mode="Markdown"
     )
-    tmp_venta.pop(user_id)
+
+    # Limpiar tmp y terminar la conversación
+    tmp_venta.pop(user_id, None)
+    return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"✅ Se añadió una cuenta de {data['Plataforma']} ({tipo}) con {perfiles} perfiles disponibles, precio ${data['precio']:.2f} cada uno.",
+        parse_mode="Markdown"
+    )
+    # Preguntar por material adjunto
+    await update.message.reply_text("¿Quieres agregar material adjunto (foto/documento) para esta cuenta? Envía el archivo o escribe 'no' para terminar.")
+    return AGREGAR_MATERIAL
+
+async def guardar_material_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    logging.info(f"guardar_material_perfil llamado por user_id={user_id}")
+    data = tmp_venta.get(user_id)
+    if not data:
+        logging.warning("guardar_material_perfil: no hay tmp_venta para este usuario")
+        await update.message.reply_text("❌ No hay registro activo. Usa /addventa de nuevo.")
+        return ConversationHandler.END
+
+    # Si el usuario escribe 'no' finalizamos el flujo
+    text = (update.message.text or "").strip()
+    if text and text.lower() == 'no':
+        await update.message.reply_text("✅ Registro completado sin material.")
+        tmp_venta.pop(user_id, None)
+        return ConversationHandler.END
+
+    correo = data.get('correo', 'unknown')
+    tipo = data.get('tipo', '')
+    import re
+    match = re.search(r'(\d+)', tipo)
+    perfiles = int(match.group(1)) if match else 1
+
+    # Debug: registrar qué tiene el mensaje
+    has_photo = bool(getattr(update.message, "photo", None))
+    has_document = bool(getattr(update.message, "document", None))
+    logging.info(f"guardar_material_perfil: has_photo={has_photo}, has_document={has_document}, text_present={bool(text)}")
+
+    if not has_photo and not has_document:
+        await update.message.reply_text("❌ Envía una foto o documento válido, o escribe 'no' para omitir.")
+        return AGREGAR_MATERIAL
+
+    # Guardar el archivo para cada perfil (si hay N perfiles, copiar el mismo archivo N veces)
+    for i in range(1, perfiles + 1):
+        try:
+            if has_document:
+                doc = update.message.document
+                file = await doc.get_file()
+                ext = os.path.splitext(doc.file_name or "")[1] or ".bin"
+                filename = f"material_{correo}_perfil{i}{ext}"
+                await file.download_to_drive(filename)
+                logging.info(f"Material guardado: {filename}")
+            elif has_photo:
+                # tomar la foto de mayor tamaño
+                photo = update.message.photo[-1]
+                file = await photo.get_file()
+                filename = f"material_{correo}_perfil{i}.jpg"
+                await file.download_to_drive(filename)
+                logging.info(f"Material guardado: {filename}")
+        except Exception as e:
+            logging.exception(f"Error descargando material (perfil {i}): {e}")
+            await update.message.reply_text("❌ Error al descargar el material. Intenta nuevamente.")
+            return AGREGAR_MATERIAL
+
+    await update.message.reply_text(f"✅ Material guardado para {perfiles} perfil(es). Registro finalizado.")
+    tmp_venta.pop(user_id, None)
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -352,6 +659,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/combos - Muestra combos disponibles.\n"
         "/verclientes - Muestra lista de clientes.\n"
         "/responder <ID> <mensaje> - Enviar mensaje a cliente.\n"
+        "/eliminarcliente <ID> - Elimina un cliente del registro.\n"
+       
     )
     cliente_comandos = (
         "👤 *Comandos de Cliente:*\n"
@@ -359,7 +668,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/saldo - Ver tu saldo actual.\n"
         "/comandos - Muestra esta lista.\n"
         "/historial - Descarga tu historial de compras.\n"
-        "/cancel - Cancela un flujo de conversación (si está activo).\n"
+        "/cancel - Cancela un flujo de conversación.\n"
         "/combos - Muestra los combos disponibles.\n"
         "⚠️ Reportar problema desde el menú principal.\n"
     )
@@ -382,25 +691,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_path = script_dir / WELCOME_IMAGE
 
     logging.info(f"Start: buscando imagen de bienvenida en: {image_path}")
+
+    # Telegram limita la longitud de caption (≈1024 chars). Si el texto es más largo,
+    # enviamos la imagen SIN caption y luego el texto en un mensaje separado.
+    MAX_CAPTION = 1024
+
     try:
         if WELCOME_IMAGE and image_path.exists():
             file_size = image_path.stat().st_size
-            logging.info(f"Start: imagen encontrada (tamaño {file_size} bytes). Intentando enviar como photo...")
+            logging.info(f"Start: imagen encontrada (tamaño {file_size} bytes). Intentando enviar...")
+
+            # Si el texto cabe en caption, intentar enviarlo como caption.
+            use_caption = len(bienvenida_text) <= MAX_CAPTION
+
             with open(image_path, "rb") as img:
                 try:
-                    # Intento principal: enviar como photo
                     if getattr(update, "message", None):
-                        await update.message.reply_photo(photo=img, caption=bienvenida_text, parse_mode="Markdown")
-                    else:
-                        await context.bot.send_photo(chat_id=user_id, photo=img, caption=bienvenida_text, parse_mode="Markdown")
-                except Exception as e_photo:
-                    logging.warning(f"Fallo send_photo: {e_photo}. Intentando enviar como documento...")
-                    # Reabrir el archivo y enviar como documento (fall back)
-                    with open(image_path, "rb") as doc:
-                        if getattr(update, "message", None):
-                            await update.message.reply_document(document=doc, caption=bienvenida_text, parse_mode="Markdown")
+                        if use_caption:
+                            await update.message.reply_photo(photo=img, caption=bienvenida_text, parse_mode="Markdown")
                         else:
-                            await context.bot.send_document(chat_id=user_id, document=doc, caption=bienvenida_text, parse_mode="Markdown")
+                            # enviar foto sin caption y luego el texto
+                            await update.message.reply_photo(photo=img)
+                            await update.message.reply_text(bienvenida_text, parse_mode="Markdown")
+                    else:
+                        if use_caption:
+                            await context.bot.send_photo(chat_id=user_id, photo=img, caption=bienvenida_text, parse_mode="Markdown")
+                        else:
+                            await context.bot.send_photo(chat_id=user_id, photo=img)
+                            await context.bot.send_message(chat_id=user_id, text=bienvenida_text, parse_mode="Markdown")
+                except Exception as e_photo:
+                    logging.warning(f"Fallo send_photo: {e_photo}. Intentando enviar como documento sin caption largo...")
+                    # En caso de fallo al enviar como photo, enviamos como documento.
+                    with open(image_path, "rb") as doc:
+                        try:
+                            if getattr(update, "message", None):
+                                # nunca usar caption largo; enviamos documento sin caption y texto aparte
+                                await update.message.reply_document(document=doc)
+                                await update.message.reply_text(bienvenida_text, parse_mode="Markdown")
+                            else:
+                                await context.bot.send_document(chat_id=user_id, document=doc)
+                                await context.bot.send_message(chat_id=user_id, text=bienvenida_text, parse_mode="Markdown")
+                        except Exception as e_doc:
+                            logging.exception(f"Fallo al enviar documento de bienvenida: {e_doc}")
+                            # último recurso: solo enviar texto
+                            if getattr(update, "message", None):
+                                await update.message.reply_text(bienvenida_text, parse_mode="Markdown")
+                            else:
+                                await context.bot.send_message(chat_id=user_id, text=bienvenida_text, parse_mode="Markdown")
         else:
             logging.warning(f"Start: imagen no encontrada en {image_path} (WELCOME_IMAGE='{WELCOME_IMAGE}')")
             if getattr(update, "message", None):
@@ -543,17 +880,19 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/saldo - Ver tu saldo.\n"
         "/comandos - Muestra esta lista.\n"
         "/stock - Ver el inventario detallado de cuentas.\n"
-        "/addventa <Plataforma> - Inicia el flujo para agregar una cuenta al stock.\n"
-        "/borrarventa - Inicia el flujo para eliminar una cuenta del stock.\n"
+        "/addventa <Plataforma> - Iniciar el flujo para agregar una cuenta al stock.\n"
+        "/borrarventa - Iniciar el flujo para eliminar una cuenta del stock.\n"
         "/recargar <ID> <monto> - Recarga saldo a un usuario.\n"
         "/quitarsaldo <ID> <monto> - Descuenta saldo a un usuario.\n"
         "/consultarsaldo <ID> - Consulta el saldo de un usuario específico.\n"
-        "/historial - Obtén el CSV de tu historial de compras.\n"
+        "/historial - Obtén el CSV con el historial de tus compras.\n"
         "/cancel - Cancela un flujo de conversación (e.g., /addventa, /borrarventa o Reporte).\n"
         "/addcombo - Inicia el flujo para agregar un nuevo combo de cuentas.\n"
         "/combos - Muestra los combos disponibles para compra.\n"
         "/verclientes - Muestra la lista de clientes con su ID y saldo.\n"
         "/responder <ID> <mensaje> - Responde a reportes o envía mensajes a clientes.\n"
+        "/eliminarcliente <ID> - Elimina un cliente del registro.\n"
+  
     )
     cliente_comandos = (
         "👤 *Comandos de Cliente:*\n"
@@ -562,7 +901,7 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/saldo - Ver tu saldo actual.\n"
         "/comandos - Muestra esta lista.\n"
         "/historial - Obtén el CSV con el historial de tus compras.\n"
-        "/cancel - Cancela un flujo de conversación (si está activo).\n"
+        "/cancel - Cancela un flujo de conversación.\n"
         "/combos - Muestra los combos disponibles para compra.\n"
         "⚠️ Reportar problema desde el menú principal.\n"
     )
@@ -579,40 +918,77 @@ async def stock_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Solo el administrador puede ver el inventario.")
         return
 
+    cleaned_stock = cleanup_stock()
     stock_info = get_dynamic_stock_info()
-    
-    if not stock_info:
+
+    # Contar por plataforma y categoría
+    counts = defaultdict(lambda: defaultdict(int))  # counts[platform][categoria] = cantidad
+    for row in cleaned_stock:
+        if len(row) < 2:
+            continue
+        platform = row[0].strip()
+        tipo = row[1].strip()
+        tipo_lower = tipo.lower()
+        categoria = 'otro'
+        if 'perfil' in tipo_lower and 'completa' not in tipo_lower:
+            categoria = 'perfil'
+        elif 'completa' in tipo_lower and 'perfil' not in tipo_lower:
+            categoria = 'completa'
+        else:
+            if tipo_lower.startswith(('1 perfil', 'perfil')):
+                categoria = 'perfil'
+            elif tipo_lower.startswith(('cuenta', 'full', 'premium', 'basico', 'estandar', 'completa')):
+                categoria = 'completa'
+            else:
+                categoria = 'otro'
+
+        if categoria == 'perfil':
+            # sumar perfiles_disponibles si existe
+            if len(row) >= 7:
+                try:
+                    perfiles_disponibles = int(row[5])
+                    counts[platform]['perfil'] += max(0, perfiles_disponibles)
+                except (ValueError, TypeError):
+                    counts[platform]['perfil'] += 0
+            else:
+                counts[platform]['perfil'] += 1
+        elif categoria == 'completa':
+            counts[platform]['completa'] += 1
+        else:
+            counts[platform]['otro'] += 1
+
+    if not counts:
         await update.message.reply_text("📦 El inventario está vacío.")
         return
 
     message = "📦 Inventario Actual:\n"
-    stock_list = load_stock()
-    
-    counts = defaultdict(int)
-    for row in stock_list:
-        # soportar filas con 5 o 7 campos
-        if len(row) >= 5:
-            try:
-                platform = row[0].strip()
-                tipo = row[1].strip()
-                precio = float(row[4])
-                key = (platform, tipo, precio)
-                counts[key] += 1
-            except (ValueError, IndexError):
+    for platform in sorted(counts.keys()):
+        message += f"\n*--- {platform.upper()} ---*\n"
+        # Para cada categoría en orden
+        for categoria in ('completa', 'perfil', 'otro'):
+            cnt = counts[platform].get(categoria, 0)
+            if cnt <= 0:
                 continue
+            # Obtener precio mínimo conocido desde stock_info
+            precio = None
+            if categoria in stock_info and platform in stock_info[categoria]:
+                p = stock_info[categoria][platform]['precio']
+                precio = p if p != float('inf') else None
 
-    sorted_keys = sorted(counts.keys())
-    
-    current_platform = None
-    for platform, tipo, precio in sorted_keys:
-        count = counts[(platform, tipo, precio)]
-        
-        if platform != current_platform:
-            message += f"\n*--- {platform.upper()} ---*\n"
-            current_platform = platform
+            if precio is None:
+                precio_f = 0.0
+            else:
+                precio_f = float(precio)
 
-        message += f"▪️ {tipo} - ${precio:.2f} (Disponibles: {count})\n"
-        
+            display_tipo = categoria if categoria in ('completa', 'perfil') else ', '.join(sorted(stock_info.get('otro', {}).get(platform, {}).get('tipos_disponibles', []))) or 'otro'
+            # Asegurar display simple para perfil (sin número)
+            if categoria == 'perfil':
+                display_tipo = 'perfil'
+            elif categoria == 'completa':
+                display_tipo = 'completa'
+
+            message += f"▪️ {display_tipo} - ${precio_f:.2f} (Disponibles: {cnt})\n"
+
     await update.message.reply_text(message, parse_mode="Markdown")
 
 def log_compra_global(user_id, plan, correo, password, precio, id_compra):
@@ -629,7 +1005,7 @@ def log_compra_global(user_id, plan, correo, password, precio, id_compra):
     logging.info(f"Compra global registrada: {id_compra} para usuario {user_id}")
 
 def log_compra(user_id, plan, correo, password, precio, id_compra):
-    """Registra la compra del usuario en su archivo de historial CSV."""
+    """Registra la compra del usuario en su archivo de historial."""
     historial_file = f'historial_{user_id}.csv'
     fecha = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
@@ -663,40 +1039,66 @@ async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Aún no tienes compras registradas en tu historial.")
 
-
 def entregar_cuenta(plataforma: str, tipo: str, precio_buscado: float):
-    """Entrega el siguiente perfil disponible y actualiza el stock."""
+    """Entrega el siguiente perfil/disponible y actualiza el stock.
+    Soporta filas de:
+      - completa: [plataforma, tipo, correo, pass, precio]
+      - perfil:   [plataforma, tipo, correo, pass, precio, perfiles_disponibles, perfil_actual]
+    Devuelve [plataforma, tipo, correo, password, precio, perfil_entregado]
+    perfil_entregado == 0 -> cuenta completa; >0 -> número de perfil entregado.
+    """
     cuentas = load_stock()
     for i, row in enumerate(cuentas):
-        # Si la cuenta tiene campo de perfiles
-        if len(row) == 7:
-            stock_plataforma, stock_tipo, correo, password, stock_precio, perfiles_disponibles, perfil_actual = row
+        if len(row) < 5:
+            continue
+
+        stock_plataforma = row[0].strip()
+        stock_tipo = row[1].strip()
+        correo = row[2] if len(row) > 2 else ''
+        password = row[3] if len(row) > 3 else ''
+        # Precio protegido y normalizado
+        try:
+            stock_precio = float(str(row[4]).strip())
+        except (ValueError, TypeError):
+            continue
+
+        # Coincidencia de plataforma/tipo/precio (tolerancia pequeña)
+        if stock_plataforma.strip().lower() != plataforma.strip().lower():
+            continue
+        if stock_tipo.strip().lower() != tipo.strip().lower():
+            continue
+        if abs(stock_precio - precio_buscado) > 0.01:
+            continue
+
+        # Caso: cuenta por perfil (con campos 5 y 6)
+        if len(row) >= 7:
             try:
-                stock_precio = float(stock_precio)
-                perfiles_disponibles = int(perfiles_disponibles)
-                perfil_actual = int(perfil_actual)
-            except ValueError:
+                perfiles_disponibles = int(row[5])
+                perfil_actual = int(row[6])
+            except (ValueError, TypeError):
+                # Datos corruptos -> saltar fila
                 continue
 
-            if stock_plataforma.strip() == plataforma.strip() and \
-               stock_tipo.strip() == tipo.strip() and \
-               abs(stock_precio - precio_buscado) < 0.01 and \
-               perfiles_disponibles > 0:
+            perfil_entregado = perfil_actual
+            if perfiles_disponibles > 1:
+                # CORRECCIÓN: usar 'perfiles_disponibles' (no 'perfil_disponibles')
+                cuentas[i][5] = str(perfiles_disponibles - 1)
+                cuentas[i][6] = str(perfil_actual + 1)
+            else:
+                # Último perfil: eliminar la fila
+                del cuentas[i]
+            save_stock(cuentas)
+            # Hacer limpieza adicional por si hay filas con perfiles <=0
+            cleanup_stock()
+            return [stock_plataforma, stock_tipo, correo, password, stock_precio, perfil_entregado]
 
-                # Entregar el perfil actual
-                perfil_entregado = perfil_actual
+        # Caso: cuenta completa (no perfiles) -> eliminar la fila al entregar
+        else:
+            del cuentas[i]
+            save_stock(cuentas)
+            cleanup_stock()
+            return [stock_plataforma, stock_tipo, correo, password, stock_precio, 0]
 
-                # Actualizar el stock
-                if perfiles_disponibles > 1:
-                    cuentas[i][5] = str(perfiles_disponibles - 1)
-                    cuentas[i][6] = str(perfil_actual + 1)
-                else:
-                    # Si ya no quedan perfiles, eliminar la cuenta
-                    del cuentas[i]
-
-                save_stock(cuentas)
-                # Devuelve la cuenta y el número de perfil entregado
-                return [stock_plataforma, stock_tipo, correo, password, stock_precio, perfil_entregado]
     return None
 
 
@@ -853,7 +1255,7 @@ async def borrar_stock_por_indice(update: Update, context: ContextTypes.DEFAULT_
             found = True
             break
             
-    # 3. Guardar el stock actualizado
+    # 3. Guardar la cuenta eliminada en el archivo de stock
     if found:
         platform, tipo, correo, _, precio = item_to_delete
         save_stock(all_stock)
@@ -881,7 +1283,13 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Muestra la selección de categorías (Perfiles/Completas).
     """
     query = update.callback_query
-    await query.answer()
+    # Intentar responder; si falla (expired), continuar y usar fallback
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logging.debug(f"show_categories: query.answer falló (posible expirado): {e}")
+    except Exception as e:
+        logging.debug(f"show_categories: query.answer unexpected: {e}")
 
     stock_info = get_dynamic_stock_info()
     
@@ -889,10 +1297,21 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_perfil = 'perfil' in stock_info and stock_info['perfil']
 
     if not has_completa and not has_perfil:
-        await query.edit_message_text(
-            "❌ No hay stock disponible en este momento. Vuelve más tarde.", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
-        )
+        try:
+            await query.edit_message_text(
+                "❌ No hay stock disponible en este momento. Vuelve más tarde.", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+            )
+        except Exception as e:
+            logging.warning(f"show_categories: fallo edit_message_text (sin stock): {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text="❌ No hay stock disponible en este momento. Vuelve más tarde.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+                )
+            except Exception as e2:
+                logging.exception(f"show_categories: fallo fallback send_message (sin stock): {e2}")
         return
 
     keyboard = []
@@ -904,12 +1323,17 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "✅ Cuentas disponibles:\n\nSelecciona si quieres Perfiles o Completas:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
+    texto = "✅ Cuentas disponibles:\n\nSelecciona si quieres Perfiles o Completas:"
+
+    # Intentar editar; si falla, enviar nuevo mensaje como fallback
+    try:
+        await query.edit_message_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        logging.warning(f"show_categories: fallo edit_message_text, enviando nuevo mensaje: {e}")
+        try:
+            await context.bot.send_message(chat_id=query.from_user.id, text=texto, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception as e2:
+            logging.exception(f"show_categories: fallo send_message fallback: {e2}")
 
 
 async def show_plataformas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -917,42 +1341,47 @@ async def show_plataformas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Muestra las plataformas disponibles DENTRO de la categoría seleccionada.
     """
     query = update.callback_query
-    await query.answer()
-    
-    category = query.data.replace('category_', '') # 'completa' o 'perfil'
-    
+    # Intentar responder; si falla (expired), continuar y usar fallback
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logging.debug(f"show_categories: query.answer falló (posible expirado): {e}")
+    except Exception as e:
+        logging.debug(f"show_categories: query.answer unexpected: {e}")
+
+    category = query.data.replace('category_', '')
     stock_info = get_dynamic_stock_info()
     platforms_in_category = stock_info.get(category, {})
-    logging.info(f"platforms_in_category -> {platforms_in_category}")
     if not platforms_in_category:
-        await query.edit_message_text(
-            f"❌ No hay stock de {category.capitalize()} disponible en este momento.", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver a Categorías", callback_data="show_categories")]])
-        )
+        # usar helper seguro abajo para edición/fallback
+        back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver a Categorías", callback_data="show_categories")]])
+        texto = f"❌ No hay stock de {category.capitalize()} disponible en este momento."
+        try:
+            await query.edit_message_text(texto, reply_markup=back_markup)
+        except BadRequest:
+            logging.debug(f"show_categories: edit_message_text expirado, enviando nuevo mensaje: {e}")
+            await context.bot.send_message(chat_id=query.from_user.id, text=texto, reply_markup=back_markup)
+        except Exception as e:
+            logging.exception(f"show_categories: fallo inesperado edit_message_text: {e}")
         return
 
     keyboard = []
     for platform, data in sorted(platforms_in_category.items()):
-        # Precio más bajo para referencia
         precio_min = data['precio']
-        # El callback_data debe llevar a la selección final del tipo/precio
-        # Guardamos la categoría y la plataforma
-        # Usamos .replace(' ', '~') para las plataformas con espacios, para que funcione en callback_data
         clean_platform = platform.replace(' ', '~')
-        keyboard.append([
-            InlineKeyboardButton(
-                f"▶️ {platform} (Desde ${precio_min:.2f})", 
-                callback_data=f"select_{category}_{clean_platform}"
-            )
-        ])
-        
+        keyboard.append([InlineKeyboardButton(f"▶️ {platform} (Desde ${precio_min:.2f})", callback_data=f"select_{category}_{clean_platform}")])
     keyboard.append([InlineKeyboardButton("⬅️ Volver a Categorías", callback_data="show_categories")])
-    
-    await query.edit_message_text(
-        f"✅ {category.capitalize()} Disponibles:\n\nSelecciona una plataforma:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    texto = f"✅ {category.capitalize()} Disponibles:\n\nSelecciona una plataforma:"
+
+    try:
+        await query.edit_message_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+    except BadRequest as e:
+        logging.debug(f"show_plataformas: edit_message_text expirado, enviando nuevo mensaje: {e}")
+        await context.bot.send_message(chat_id=query.from_user.id, text=texto, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        logging.exception(f"show_plataformas: fallo inesperado edit_message_text: {e}")
+
 
 async def handle_platform_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -970,22 +1399,41 @@ async def handle_platform_selection(update: Update, context: ContextTypes.DEFAUL
     # Buscar el primer stock disponible de la plataforma y categoría seleccionada
     all_stock = load_stock()
     for row in all_stock:
-        stock_platform, stock_tipo, _, _, stock_precio_str = row
-        stock_tipo_lower = stock_tipo.lower()
-        is_completa = 'completa' in stock_tipo_lower and 'perfil' not in stock_tipo_lower
-        is_perfil = 'perfil' in stock_tipo_lower
-        current_category = ''
-        if is_completa:
-            current_category = 'completa'
-        elif is_perfil:
-            current_category = 'perfil'
-        if stock_platform.strip().lower() == platform.strip().lower() and current_category == category:
+        # Protección contra filas cortas o malformadas
+        if not row or len(row) < 2:
+            logging.debug(f"handle_platform_selection: fila inválida ignorada: {row}")
+            continue
+
+        stock_platform = row[0].strip() if len(row) > 0 else ''
+        stock_tipo = row[1].strip() if len(row) > 1 else ''
+        precio_str = row[4] if len(row) > 4 else row[-1]
+        try:
+            stock_precio = float(str(precio_str).strip())
+        except (ValueError, TypeError):
+            continue
+
+        tipo_lower = stock_tipo.lower()
+        plataforma_clave = stock_platform.strip()
+        
+        categoria = 'otro'
+        if 'perfil' in tipo_lower and 'completa' not in tipo_lower:
+            categoria = 'perfil'
+        elif 'completa' in tipo_lower and 'perfil' not in tipo_lower:
+            categoria = 'completa'
+        else:
+            # Lógica de respaldo
+            if tipo_lower.startswith(('1 perfil', 'perfil')):
+                categoria = 'perfil'
+            elif tipo_lower.startswith(('cuenta', 'full', 'premium', 'basico', 'estandar', 'completa')):
+                categoria = 'completa'
+
+        if stock_platform.strip().lower() == platform.strip().lower() and categoria == category:
             try:
-                stock_precio = float(stock_precio_str)
-                clean_platform = platform.replace(' ', '~')
-                clean_type = stock_tipo.replace(' ', '~')
+                clean_platform = platform.replace('~', ' ')
+                clean_type = stock_tipo.replace('~', ' ')
                 callback_data = f"buy_{category}_{clean_platform}_{clean_type}_{stock_precio}"
-                
+
+                # Construir fake_update compatible: incluir callback_query, effective_user y message
                 fake_query = SimpleNamespace()
                 fake_query.data = callback_data
                 fake_query.from_user = query.from_user
@@ -994,20 +1442,30 @@ async def handle_platform_selection(update: Update, context: ContextTypes.DEFAUL
 
                 fake_update = SimpleNamespace()
                 fake_update.callback_query = fake_query
+                fake_update.effective_user = query.from_user  # necesario para show_main_menu y otros
+                fake_update.message = query.message  # por si alguna función usa update.message
 
                 await handle_compra_final(fake_update, context, callback_data=callback_data)
                 return
-            except ValueError:
+            except (ValueError, TypeError) as e:
+                logging.debug(f"handle_platform_selection: precio inválido en fila {row}: {e}")
                 continue
+
     # Si no hay stock
     await query.edit_message_text(
         f"❌ No hay stock disponible para {platform} en este momento.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver a Plataformas", callback_data=f"category_{category}")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver a Categorías", callback_data="show_categories")]])
     )
 
 
 async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data=None):
     query = update.callback_query
+    # RESPONDER AL CALLBACK PARA QUE EL CLIENTE DEJE DE CARGAR
+    try:
+        await query.answer()
+    except Exception as e:
+        logging.debug(f"Ignored query.answer() error in handle_compra_final: {e}")
+
     if callback_data is None:
         callback_data = query.data
 
@@ -1016,6 +1474,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     inicializar_usuario(user_id)
     
     parts = callback_data.split('_')
+    
     # Protección: validar estructura mínima del callback_data
     if len(parts) < 4:
         logging.error(f"Callback data malformado: {callback_data}")
@@ -1089,6 +1548,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 4. Enviar cuenta al usuario (NUEVO MENSAJE)
     logging.info(f"Entrega preparada: cuenta_data={cuenta_data}, user_id={user_id}, precio={precio_final:.2f}, saldo_restante={clientes[user_id]:.2f}, id_compra={id_compra}")
 
+    perfil_text = "Cuenta Completa" if perfil_entregado == 0 else f"Perfil {perfil_entregado}"
     mensaje_entrega = (
         "🎉 ¡Tu cuenta ha sido entregada! 🎉\n"
         "--------------------------------------\n"
@@ -1096,7 +1556,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"➡️ Tipo: {plan_entregado}\n"
         f"➡️ Correo: {correo}\n"
         f"➡️ Contraseña: {password}\n"
-        f"➡️ Perfil asignado: Perfil {perfil_entregado}\n"
+        f"➡️ Perfil asignado: {perfil_text}\n"
         f"➡️ Costo: ${precio_final:.2f}\n"
         "--------------------------------------\n"
         f"🛡️ Garantía: {GARANTIA_DIAS} días\n"
@@ -1127,11 +1587,11 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await context.bot.send_document(
                     chat_id=user_id,
                     document=f,
-                    caption=f"Material para tu Perfil {perfil_entregado}"
+                    caption=f"Material para tu {perfil_text}"
                 )
         except Exception as e:
             logging.exception(f"No se pudo enviar material '{material_filename}' a {user_id}: {e}")
-            # No abortar; la compra ya está registrada
+            # continuar con el flujo, no abortar
 
     # 5. Abrir automáticamente el menú principal (NUEVO MENSAJE)
     await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
@@ -1174,103 +1634,346 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, wel
              parse_mode="Markdown"
          )
         
-async def show_recarga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la información de recarga y el botón para volver."""
-    user_id = update.effective_user.id
-    await update.callback_query.answer()
+# Helper: construir texto y teclado de recarga
+def _build_recarga_info(user_id: int):
+    whatsapp = ADMIN_WHATSAPP or "(no configurado)"
+    bank = BANK_ACCOUNT or "(no configurada)"
+    min_text = f"${MIN_RECARGA:.2f}"
     back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
-    await update.callback_query.edit_message_text(
-        f"💰 Tu saldo actual es: ${clientes[user_id]:.2f}\n\n"
-        f"Para recargar, contacta al administrador e indica tu ID de usuario: {user_id}.",
-        reply_markup=back_keyboard,
-        parse_mode="Markdown"
+    texto = (
+        f"💰 Tu saldo actual es: ${clientes.get(user_id, 0):.2f}\n\n"
+        "Para recargar realiza una transferencia o depósito y envía el comprobante por WhatsApp con tu ID de cliente.\n\n"
+        f"📲 WhatsApp (envía comprobante): {whatsapp}\n"
+        f"🏦 Cuenta / Referencia: {bank}\n\n"
+        f"🔎 Tu ID de cliente (indícalo en el comprobante/WhatsApp): `{user_id}`\n"
+        f"⚠️ Mínimo de recarga: {min_text} pesos.\n\n"
+        "Envía el comprobante al WhatsApp indicado junto con tu ID de cliente para que procesemos la recarga."
     )
+    return texto, back_keyboard
 
-# Nueva configuración de contacto / bienvenida (coloca aquí tu número e imagen)
-ADMIN_PHONE = ""  # Ej: "+52 844 212 5550"  <- Rellena con tu número
-WELCOME_IMAGE = "welcome_bot.jpg"  # Nombre del archivo de la imagen de bienvenida (colócala en el mismo directorio)
+async def recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/recargar <ID_USUARIO> <monto> (Admin) o muestra instrucciones (Usuario)."""
+    user = update.effective_user or (update.message.from_user if update.message else None)
+    if not user:
+        return
+    user_id = user.id
 
-# --- Lógica de Validación de ID de Compra ---
-def validar_id_compra(user_id: int, id_compra: str) -> bool:
-    """Verifica si el ID de compra fue emitido al user_id proporcionado."""
+    # Admin: permitir recarga por comando
+    if is_admin(user_id) and context.args and len(context.args) == 2:
+        try:
+            target_id = int(context.args[0])
+            monto = float(context.args[1])
+            if monto <= 0:
+                await update.message.reply_text("❌ El monto debe ser positivo.")
+                return
+            inicializar_usuario(target_id)
+            clientes[target_id] += monto
+            guardar_clientes()
+            await update.message.reply_text(f"✅ Recarga exitosa a ID {target_id} de ${monto:.2f}. Saldo actual: ${clientes[target_id]:.2f}")
+            try:
+                await context.bot.send_message(chat_id=target_id, text=f"🎉 Tu saldo ha sido recargado con ${monto:.2f} por el administrador. Saldo actual: ${clientes[target_id]:.2f}", parse_mode="Markdown")
+            except Exception:
+                logging.warning(f"No se pudo enviar notificación al usuario {target_id}.")
+        except ValueError:
+            await update.message.reply_text("❌ ID de usuario o Monto inválido. Ambos deben ser números.")
+        return
+
+    # Usuario normal -> mostrar instrucciones reutilizando el helper
+    inicializar_usuario(user_id)
+    texto, back_keyboard = _build_recarga_info(user_id)
+    # si viene por callback no usamos update.message
+    if getattr(update, "callback_query", None):
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+        try:
+            await update.callback_query.edit_message_text(texto, reply_markup=back_keyboard, parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=back_keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(texto, reply_markup=back_keyboard, parse_mode="Markdown")
+
+async def show_recarga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para botón 'Recargar saldo' del menú — reutiliza el helper."""
+    query = getattr(update, "callback_query", None)
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id if update.effective_user else (update.message.from_user.id if update.message else None)
+        if not user_id:
+            return
+
+    texto, back_keyboard = _build_recarga_info(user_id)
     try:
-        with open(COMPRAS_FILE, 'r') as f:
-            reader = csv.reader(f)
-            # Saltar encabezado
-            next(reader, None)
-            for row in reader:
-                # Formato: ['ID_Compra', 'ID_Usuario', 'Fecha', 'Plan', 'Correo', 'Contraseña', 'Precio']
-                if len(row) > 1 and row[0].strip() == id_compra.strip() and int(row[1]) == user_id:
+        if query:
+            await query.edit_message_text(texto, reply_markup=back_keyboard, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=back_keyboard, parse_mode="Markdown")
+    except Exception:
+        await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=back_keyboard, parse_mode="Markdown")
+
+# Helper: normalizar y validar fecha DD/MM/YYYY
+def _normalize_fecha_input(text: str):
+    """Intenta convertir entradas como '01012025', '01-01-2025', '1/1/25' a 'DD/MM/YYYY'.
+    Devuelve la cadena formateada 'DD/MM/YYYY' si es válida, o None si no."""
+    if not text:
+        return None
+    s = re.sub(r'[^0-9]', '', text)  # quitar todo lo que no sea dígito
+    # aceptar ddmmyyyy (8), ddmmyy (6) => asumir siglo 2000
+    if len(s) == 8:
+        dd, mm, yyyy = s[:2], s[2:4], s[4:]
+    elif len(s) == 6:
+        dd, mm, yy = s[:2], s[2:4], s[4:]
+        yyyy = '20' + yy
+    else:
+        return None
+    try:
+        dt = datetime.strptime(f"{dd}/{mm}/{yyyy}", "%d/%m/%Y")
+        # devolver formato con ceros y 4 dígitos año
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return None
+
+    # Robustizar validación de ID de compra: sanitiza y busca tanto en COMPRAS_FILE como en historial_{user}.csv
+import string
+def _sanitize_id(id_str: str) -> str:
+    """Quita espacios, backticks y caracteres no alfanuméricos; devuelve en MAYÚSCULAS."""
+    if not id_str:
+        return ""
+    s = str(id_str).strip()
+    # quitar backticks y comillas y caracteres de formato comunes que el usuario puede copiar
+    s = s.replace("`", "").replace("'", "").replace('"', "").replace("“", "").replace("”", "").strip()
+    # conservar solo letras y números y guiones bajos/medios por si los IDs los incluyen
+    allowed = set(string.ascii_letters + string.digits + "-_")
+    cleaned = "".join(ch for ch in s if ch in allowed)
+    return cleaned.upper()
+
+def validar_id_compra(user_id: int, id_compra: str) -> bool:
+    """Verifica si el ID de compra pertenece a user_id.
+    Intenta leer los CSV probando varias codificaciones para evitar UnicodeDecodeError.
+    Busca en compras_global.csv (CWD y carpeta del script) y en historial_{user_id}.csv."""
+    id_clean = _sanitize_id(id_compra)
+    if not id_clean:
+        logging.info("validar_id_compra: id vacío después de sanitizar.")
+        return False
+
+    script_dir = Path(__file__).resolve().parent
+
+    posibles_global = [
+        Path(COMPRAS_FILE),              # ruta relativa al CWD
+        script_dir / COMPRAS_FILE        # ruta en la carpeta del script
+    ]
+
+    posibles_hist = [
+        Path(f"historial_{user_id}.csv"),
+        script_dir / f"historial_{user_id}.csv"
+    ]
+
+    encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+
+    def _read_csv_try(path: Path):
+        """Generator: intenta abrir path usando varias codificaciones y devuelve filas."""
+        for enc in encodings_to_try:
+            try:
+                with path.open('r', newline='', encoding=enc) as f:
+                    logging.debug(f"validar_id_compra: leyendo {path} con encoding={enc}")
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader, start=1):
+                        yield enc, i, row
+                return
+            except UnicodeDecodeError as ude:
+                logging.warning(f"validar_id_compra: fallo decoding {path} with {enc}: {ude}")
+                continue
+            except Exception as e:
+                logging.exception(f"validar_id_compra: error abriendo {path} con {enc}: {e}")
+                return
+        # último intento: abrir con replacement para evitar excepciones
+        try:
+            with path.open('r', newline='', encoding=encodings_to_try[-1], errors='replace') as f:
+                logging.warning(f"validar_id_compra: usando fallback errors='replace' para {path}")
+                reader = csv.reader(f)
+                for i, row in enumerate(reader, start=1):
+                    yield encodings_to_try[-1], i, row
+        except Exception as e:
+            logging.exception(f"validar_id_compra: fallback fallo abriendo {path}: {e}")
+            return
+
+    logging.info(f"validar_id_compra: buscando ID {id_clean} para user {user_id} en rutas: {posibles_global + posibles_hist}")
+
+    # Buscar en archivos globales
+    for p in posibles_global:
+        try:
+            if not p.exists():
+                logging.debug(f"validar_id_compra: {p} no existe, saltando.")
+                continue
+            for enc, i, row in _read_csv_try(p):
+                if not row:
+                    continue
+                # Saltar cabecera si detectada
+                first = (row[0] or "").strip().upper()
+                if i == 1 and first.startswith("ID"):
+                    continue
+                row_id_raw = row[0] if len(row) > 0 else ""
+                row_id = _sanitize_id(row_id_raw)
+                row_user = None
+                if len(row) > 1:
+                    try:
+                        row_user = int(str(row[1]).strip())
+                    except Exception:
+                        row_user = None
+                logging.debug(f"validar_id_compra: {p} (enc={enc}) linea {i}: id_raw={row_id_raw!r} -> {row_id!r}, user_col={row_user}")
+                if row_id == id_clean and row_user == user_id:
+                    logging.info(f"validar_id_compra: encontrado en {p} (enc={enc}) -> {row}")
                     return True
-    except FileNotFoundError:
-        logging.warning(f"{COMPRAS_FILE} no existe.")
-    except Exception as e:
-        logging.error(f"Error al leer {COMPRAS_FILE}: {e}")
-        
+        except Exception as e:
+            logging.exception(f"validar_id_compra: error leyendo {p}: {e}")
+
+    # Respaldo: buscar en historial_{user_id}.csv
+    for p in posibles_hist:
+        try:
+            if not p.exists():
+                logging.debug(f"validar_id_compra: historial {p} no existe, saltando.")
+                continue
+            for enc, i, row in _read_csv_try(p):
+                if not row:
+                    continue
+                # No asumir formato fijo de cabecera; comprobación igual
+                row_id_raw = row[0] if len(row) > 0 else ""
+                row_id = _sanitize_id(row_id_raw)
+                logging.debug(f"validar_id_compra (hist {p}) (enc={enc}): linea {i}: id_raw={row_id_raw!r} -> {row_id!r}")
+                if row_id == id_clean:
+                    logging.info(f"validar_id_compra: encontrado en historial {p} (enc={enc}) -> {row}")
+                    return True
+        except Exception as e:
+            logging.exception(f"validar_id_compra: error leyendo historial {p}: {e}")
+
+    logging.info(f"validar_id_compra: ID {id_compra} ({id_clean}) no encontrado para user {user_id}")
     return False
 
-# --- Flujo de Reporte (Conversación) ---
-
 async def reporte_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Punto de entrada para el flujo de reporte."""
-    user_id = update.effective_user.id
+    """Punto de entrada para el flujo de reporte.
+    Responde al callback del botón, edita el mensaje si es posible o envía uno nuevo como fallback.
+    Devuelve REPORTE_ID_COMPRA para iniciar la conversación."""
+    query = getattr(update, "callback_query", None)
+
+    # Determinar usuario de forma robusta
+    user = None
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        user = query.from_user
+    else:
+        user = update.effective_user or (update.message.from_user if getattr(update, "message", None) else None)
+
+    if not user:
+        logging.debug("reporte_start: no se pudo determinar el usuario.")
+        return ConversationHandler.END
+
+    user_id = user.id
     tmp_reporte[user_id] = {}
-    
-    await update.callback_query.edit_message_text(
+
+    texto = (
         "📝 Inicio del Reporte\n\n"
-        "Ingresa el ID de Compra de la cuenta que presenta problemas (lo encuentras en el mensaje de entrega):",
-        parse_mode="Markdown"
+        "Ingresa el ID de Compra de la cuenta que presenta problemas (lo encuentras en el mensaje de entrega):"
     )
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+
+    # Intentar editar el mensaje del teclado inline; si falla, enviar mensaje privado
+    try:
+        if query:
+            await query.edit_message_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=reply_markup, parse_mode="Markdown")
+    except BadRequest as e:
+        logging.debug(f"reporte_start: edit_message_text falló ({e}); enviando mensaje directo a {user_id}")
+        try:
+            await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception as ex:
+            logging.exception(f"reporte_start: no se pudo enviar mensaje a {user_id}: {ex}")
+            return ConversationHandler.END
+    except Exception as e:
+        logging.exception(f"reporte_start: error inesperado al iniciar reporte para {user_id}: {e}")
+        return ConversationHandler.END
+
     return REPORTE_ID_COMPRA
 
 async def reporte_id_compra_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Paso 1: Recibe el ID de Compra y lo valida."""
+    """Paso 1: Recibe el ID de Compra y lo valida. Sanea entrada y loggea para depuración."""
     user_id = update.message.from_user.id
-    id_compra = update.message.text.strip().upper()
-    
+    raw = (update.message.text or "").strip()
+    id_compra = _sanitize_id(raw)  # usa la función de sanitización que ya definiste
+
+    logging.info(f"reporte_id_compra_recibida: user={user_id} raw_input={raw!r} sanitized={id_compra!r}")
+
     if not id_compra or len(id_compra) < 4:
-        await update.message.reply_text("❌ El ID de Compra es muy corto o está vacío. Intenta nuevamente:")
+        await update.message.reply_text("❌ El ID de Compra es muy corto o está vacío. Debe tener al menos 4 caracteres alfanuméricos. Intenta nuevamente:")
         return REPORTE_ID_COMPRA
-        
-    # VALIDACIÓN CLAVE
-    if not validar_id_compra(user_id, id_compra):
+
+    # Detectar entradas claramente inválidas (ej: palabras como 'PERFIL', 'CUENTA', etc.)
+    if any(word in id_compra for word in ("PERFIL", "CUENTA", "COMPLETA", "PERF")):
         await update.message.reply_text(
-            f"❌ ID de Compra inválido: El ID {id_compra} no se encuentra en tu historial de compras o no te pertenece. "
-            "Verifica que el ID sea correcto e inténtalo de nuevo, o /cancel.",
-            parse_mode="Markdown"
+            "❌ Parece que has pegado algo que no es un ID (por ejemplo 'Perfil' o 'Cuenta'). "
+            "Pega sólo el ID de compra que aparece en tu mensaje de entrega (ej: `A1B2C3D4`). Intenta de nuevo:"
         )
         return REPORTE_ID_COMPRA
-        
+
+    # VALIDACIÓN CLAVE
+    try:
+        if not validar_id_compra(user_id, id_compra):
+            await update.message.reply_text(
+                f"❌ ID de Compra inválido: El ID `{raw}` no se encuentra en tu historial de compras o no te pertenece. "
+                "Verifica que el ID sea correcto e inténtalo de nuevo, o /cancel.",
+                parse_mode="Markdown"
+            )
+            logging.debug(f"reporte_id_compra_recibida: validación fallida para user={user_id} id={id_compra}")
+            return REPORTE_ID_COMPRA
+    except Exception as e:
+        logging.exception(f"reporte_id_compra_recibida: error validando id {id_compra} para user {user_id}: {e}")
+        await update.message.reply_text("❌ Error interno validando el ID. Intenta más tarde o contacta al administrador.")
+        return ConversationHandler.END
+
     tmp_reporte[user_id]['id_compra'] = id_compra
-    
     await update.message.reply_text("✅ ID Validado. Ahora ingresa el correo de la cuenta:", parse_mode="Markdown")
     return REPORTE_CORREO
 
 async def reporte_correo_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Paso 2: Recibe el correo del reporte."""
+    """Paso 2: Recibe el correo del reporte. Valida formato básico de email."""
     user_id = update.message.from_user.id
     correo = update.message.text.strip()
     if not correo:
         await update.message.reply_text("❌ El correo no puede estar vacío. Intenta nuevamente:")
         return REPORTE_CORREO
-        
-    tmp_reporte[user_id]['correo'] = correo
 
+    # Validación simple de correo (básica, no exhaustiva)
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", correo):
+        await update.message.reply_text("❌ Formato de correo inválido. Ejemplo válido: usuario@dominio.com. Intenta nuevamente:")
+        return REPORTE_CORREO
+
+    tmp_reporte[user_id]['correo'] = correo
     await update.message.reply_text("Ingresa la contraseña de la cuenta:", parse_mode="Markdown")
     return REPORTE_PASS
 
 async def reporte_pass_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Paso 3: Recibe la contraseña del reporte."""
+    """Paso 3: Recibe y valida la contraseña."""
     user_id = update.message.from_user.id
     password = update.message.text.strip()
     if not password:
         await update.message.reply_text("❌ La contraseña no puede estar vacía. Intenta nuevamente:")
         return REPORTE_PASS
-        
+
     tmp_reporte[user_id]['pass'] = password
-    
+
+    # Instrucción clara y ejemplo práctico; indicar que puede escribir sin '/' y se formatea
     await update.message.reply_text(
-        "Ingresa la fecha en que compraste esta cuenta (Formato: DD/MM/AAAA):",
+        "Ingresa la fecha en que compraste esta cuenta (Formato: DD/MM/AAAA).\n"
+        "Puedes escribir por ejemplo: 01/01/2025 o 01012025 — la fecha se normalizará automáticamente.",
         parse_mode="Markdown"
     )
     return REPORTE_FECHA
@@ -1280,16 +1983,17 @@ async def reporte_fecha_recibida(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.message.from_user.id
     fecha_compra_str = update.message.text.strip()
     
-    try:
-        datetime.strptime(fecha_compra_str, '%d/%m/%Y')
-    except ValueError:
+    # Normalizar y validar fecha
+    fecha_compra_norm = _normalize_fecha_input(fecha_compra_str)
+    if not fecha_compra_norm:
         await update.message.reply_text(
             "❌ Formato de fecha incorrecto. Usa DD/MM/AAAA (ej: 01/10/2025). Intenta nuevamente:",
             parse_mode="Markdown"
         )
         return REPORTE_FECHA
-        
-    tmp_reporte[user_id]['fecha_compra'] = fecha_compra_str
+
+    # Guardar fecha normalizada
+    tmp_reporte[user_id]['fecha_compra'] = fecha_compra_norm
     
     await update.message.reply_text(
         "📝 Describe detalladamente el problema que presenta la cuenta. Si tienes una captura de pantalla, ¡puedes enviarla ahora mismo junto con tu texto!",
@@ -1298,9 +2002,31 @@ async def reporte_fecha_recibida(update: Update, context: ContextTypes.DEFAULT_T
     return REPORTE_DESCRIPCION
 
 async def reporte_descripcion_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Paso 5: Recibe la descripción y/o foto y envía el reporte al Admin."""
+    """Paso 5: Recibe la descripción y/o foto y envía el reporte al Admin.
+    Valida que todos los campos previos estén presentes antes de enviar."""
     user_id = update.message.from_user.id
-    data = tmp_reporte.pop(user_id, {})
+    # Comprobar que aún existe el tmp_reporte para el usuario
+    data = tmp_reporte.get(user_id)
+    if not data:
+        await update.message.reply_text("❌ No se encontró un reporte en curso. Inicia el reporte desde el menú y sigue los pasos.", parse_mode="Markdown")
+        return ConversationHandler.END
+
+    # Validar campos obligatorios recopilados
+    missing = []
+    for key, label in (('id_compra', 'ID de Compra'), ('correo', 'Correo'), ('pass', 'Contraseña'), ('fecha_compra', 'Fecha de compra')):
+        if not data.get(key):
+            missing.append(label)
+
+    if missing:
+        await update.message.reply_text(
+            f"❌ Faltan campos obligatorios en el reporte: {', '.join(missing)}.\n"
+            "Por favor reinicia el reporte con el botón 'Reportar problema' y completa todos los pasos.",
+            parse_mode="Markdown"
+        )
+        # limpiar estado si lo deseas
+        tmp_reporte.pop(user_id, None)
+        return ConversationHandler.END
+
     descripcion = ""
     foto_id = None
 
@@ -1313,6 +2039,13 @@ async def reporte_descripcion_recibida(update: Update, context: ContextTypes.DEF
         if update.message.caption:
             descripcion = update.message.caption.strip()
 
+    # Si no hay descripción textual, exigir al menos una descripción
+    if not descripcion and not foto_id:
+        await update.message.reply_text("❌ Debes proporcionar una descripción del problema o una foto. Intenta nuevamente:")
+        return REPORTE_DESCRIPCION
+
+    # Extraer y limpiar datos
+    data = tmp_reporte.pop(user_id, {})
     reporte_msg = (
         "🚨 NUEVO REPORTE DE CUENTA\n"
         "-------------------------------\n"
@@ -1320,19 +2053,15 @@ async def reporte_descripcion_recibida(update: Update, context: ContextTypes.DEF
         f"📧 Correo reportado: {data.get('correo','')}\n"
         f"🔑 Contraseña reportada: {data.get('pass','')}\n"
         f"📅 Fecha de Compra: {data.get('fecha_compra','')}\n"
-        f"🛡 Garantía: {GARANTIA_DIAS} días\n"
+        f"🛡️ Garantía: {GARANTIA_DIAS} días\n"
         f"🆔 ID de Compra: {data.get('id_compra','')}\n"
         f"📝 Descripción: {descripcion}\n"
         "-------------------------------\n"
-        "El administrador debe revisar esta cuenta. La garantía es de 25 días."
+        "El administrador debe revisar esta cuenta. Los reportes tardan de 3-4 días máximo."
     )
 
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=reporte_msg,
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=ADMIN_ID, text=reporte_msg, parse_mode="Markdown")
         if foto_id:
             await context.bot.send_photo(
                 chat_id=ADMIN_ID,
@@ -1341,12 +2070,12 @@ async def reporte_descripcion_recibida(update: Update, context: ContextTypes.DEF
                 parse_mode="Markdown"
             )
         await update.message.reply_text(
-            "✅ Reporte enviado al administrador. Nos pongamos en contacto contigo pronto.",
+            "✅ Reporte enviado al administrador. Nos pondremos en contacto contigo pronto.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
         )
     except Exception as e:
         logging.error(f"Error al enviar reporte al admin: {e}")
-        await update.message.reply_text("❌ Error al enviar el reporte. Por favor, contacta al administrador manualmente.",)
+        await update.message.reply_text("❌ Error al enviar el reporte. Por favor, contacta al administrador manualmente.")
 
     return ConversationHandler.END
 
@@ -1426,45 +2155,32 @@ async def responder_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error al enviar la foto: {e}")
 
 
-async def guardar_material_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    data = tmp_venta.get(user_id)
-    if not data:
-        await update.message.reply_text("❌ No hay registro activo. Usa /addventa de nuevo.")
-        return ConversationHandler.END
-
-    correo = data['correo']
-    tipo = data['tipo']
-    import re
-    match = re.search(r'(\d+)', tipo)
-    perfiles = int(match.group(1)) if match else 1
-
-    # Guardar el archivo para cada perfil
-    for i in range(1, perfiles+1):
-        if update.message.document:
-            file = await update.message.document.get_file()
-            ext = os.path.splitext(update.message.document.file_name)[1]
-            filename = f"material_{correo}_perfil{i}{ext}"
-            await file.download_to_drive(filename)
-        elif update.message.photo:
-            file = await update.message.photo[-1].get_file()
-            filename = f"material_{correo}_perfil{i}.jpg"
-            await file.download_to_drive(filename)
-
-    await update.message.reply_text(f"✅ Material guardado para {perfiles} perfiles. Registro finalizado.")
-    tmp_venta.pop(user_id, None)
-    return ConversationHandler.END
-
-
 # --- Flujo para agregar combos (solo Admin) ---
 
 async def addcombo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("❌ Solo el administrador puede agregar combos.")
+        try:
+            await update.message.reply_text("❌ Solo el administrador puede agregar combos.")
+        except Exception:
+            logging.exception("addcombo_start: fallo reply_text para no-admin")
         return ConversationHandler.END
+
     context.user_data['nuevo_combo'] = {}
-    await update.message.reply_text("📝 Escribe el nombre principal del combo (título):")
+
+    inicio_text = "📝 Escribe el nombre principal del combo (título):"
+    try:
+        await update.message.reply_text(inicio_text)
+    except Exception:
+        logging.exception("addcombo_start: error enviando mensaje de inicio del combo")
+        # Intento secundario usando context.bot (puede fallar también)
+        try:
+            await context.bot.send_message(chat_id=user_id, text=inicio_text)
+        except Exception:
+            logging.exception("addcombo_start: fallo también con context.bot.send_message — abortando flujo")
+            # No podemos comunicarnos con Telegram; abortar conversación de forma segura
+            return ConversationHandler.END
+
     return ADD_COMBO_TITULO
 
 async def addcombo_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1504,33 +2220,320 @@ async def addcombo_plataformas(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data['nuevo_combo']['plataformas'].append(texto)
         await update.message.reply_text("Agrega otra plataforma o escribe 'listo' para terminar:")
 
-# Handler para mostrar combos en el menú principal
+# Helper: plataformas únicas en stock
+def get_stock_platforms():
+    """Devuelve las plataformas únicas actualmente en stock, ordenadas."""
+    cuentas = cleanup_stock()
+    plataformas = []
+    for row in cuentas:
+        if row and len(row) > 0:
+            plat = row[0].strip()
+            if plat and plat not in plataformas:
+                plataformas.append(plat)
+    return sorted(plataformas, key=lambda s: s.lower())
+
+async def addcombo_platform_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja selección toggle de plataformas vía botones durante creación de combo."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = (query.data or "")
+    if not data.startswith("addcombo_plat_"):
+        return
+
+    plat_encoded = data.replace("addcombo_plat_", "")
+    plataforma = plat_encoded.replace("~", " ")
+
+    # Asegurar estructura
+    context.user_data.setdefault('nuevo_combo', {})
+    context.user_data['nuevo_combo'].setdefault('plataformas', [])
+
+    # Toggle añadido/eliminado
+    if plataforma in context.user_data['nuevo_combo']['plataformas']:
+        context.user_data['nuevo_combo']['plataformas'].remove(plataforma)
+        accion = "eliminada"
+    else:
+        context.user_data['nuevo_combo']['plataformas'].append(plataforma)
+        accion = "añadida"
+
+    # Reconstruir teclado con marcas ✅ para seleccionadas
+    plataformas = get_stock_platforms()
+    keyboard = []
+    for plat in plataformas:
+        label = plat
+        if plat in context.user_data['nuevo_combo']['plataformas']:
+            label = "✅ " + plat
+        clean = plat.replace(' ', '~')
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"addcombo_plat_{clean}")])
+
+    keyboard.append([InlineKeyboardButton("✅ Finalizar selección", callback_data="addcombo_done")])
+    keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="empezar")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    seleccionadas = context.user_data['nuevo_combo']['plataformas']
+    seleccion_text = ", ".join(seleccionadas) if seleccionadas else "(ninguna)"
+    texto = f"🔁 Plataforma *{plataforma}* {accion}.\n\nPlataformas seleccionadas: *{seleccion_text}*\n\nPulsa más plataformas o Finalizar selección."
+
+    try:
+        await query.edit_message_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+    except BadRequest:
+        # Mensaje expirado -> enviar nuevo mensaje
+        await context.bot.send_message(chat_id=query.from_user.id, text=texto, reply_markup=reply_markup, parse_mode="Markdown")
+
+    # Mantener la conversación en el mismo estado
+    return ADD_COMBO_PLATAFORMAS
+
+async def volver_al_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Responde al botón '⬅️ Volver al Menú' (callback_data='empezar')."""
+    query = getattr(update, "callback_query", None)
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+    await show_main_menu(update, context)
+
+# Handler para el botón "Volver al Menú" (callback_data="empezar")
+async def addcombo_finish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finaliza el combo desde el botón 'Finalizar'."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    combo = context.user_data.get('nuevo_combo', {})
+    plataformas = combo.get('plataformas', [])
+
+    if not plataformas:
+        if query:
+            try:
+                await query.edit_message_text("❌ No has seleccionado ninguna plataforma. Selecciona al menos una antes de finalizar.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="empezar")]]))
+            except BadRequest:
+                await context.bot.send_message(chat_id=query.from_user.id, text="❌ No has seleccionado ninguna plataforma. Selecciona al menos una antes de finalizar.")
+        else:
+            await context.bot.send_message(chat_id=update.effective_user.id, text="❌ No has seleccionado ninguna plataforma.")
+        return ADD_COMBO_PLATAFORMAS
+
+    combos.append(combo)
+    save_combos_csv()  # Persistir al crear por botones
+
+    texto_confirm = f"✅ Combo creado:\n*{combo.get('titulo','Sin título')}* ({combo.get('subnombre','')})\nPrecio: ${combo.get('precio',0.0):.2f}\nPlataformas: {', '.join(plataformas)}"
+    try:
+        if query:
+            await query.edit_message_text(texto_confirm, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=update.effective_user.id, text=texto_confirm, parse_mode="Markdown")
+    except BadRequest:
+        await context.bot.send_message(chat_id=update.effective_user.id, text=texto_confirm)
+
+    # Limpiar estado y terminar
+    context.user_data.pop('nuevo_combo', None)
+    return ConversationHandler.END
+
 async def show_combos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la lista de combos y botones para comprar (callback `comprar_combo_{i}`)."""
     keyboard = []
     mensaje = "🎁 *Combos disponibles:*\n\n"
+
+    if not combos:
+        mensaje = "❌ No hay combos disponibles en este momento."
+        keyboard = [[InlineKeyboardButton("⬅️ Volver al menú", callback_data="empezar")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if getattr(update, "callback_query", None):
+            query = update.callback_query
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+            except Exception:
+                await context.bot.send_message(chat_id=query.from_user.id, text=mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+        return
+
     for i, combo in enumerate(combos):
-        mensaje += f"{i+1}. *{combo['titulo']}* ({combo['subnombre']}) - ${combo['precio']:.2f}\n"
-        mensaje += "   Plataformas: " + ", ".join(combo['plataformas']) + "\n"
-        keyboard.append([InlineKeyboardButton(f"Comprar {combo['titulo']}", callback_data=f"comprar_combo_{i}")])
+        titulo = combo.get('titulo', 'Sin título')
+        sub = combo.get('subnombre', '')
+        precio = float(combo.get('precio', 0.0))
+        plataformas = combo.get('plataformas', [])
+        mensaje += f"{i+1}. *{titulo}* ({sub}) - ${precio:.2f}\n"
+        mensaje += "   Plataformas: " + (", ".join(plataformas) if plataformas else "(no definidas)") + "\n"
+        keyboard.append([InlineKeyboardButton(f"Comprar {titulo}", callback_data=f"comprar_combo_{i}")])
+
     keyboard.append([InlineKeyboardButton("⬅️ Volver al menú", callback_data="empezar")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Si viene de CallbackQuery, usar edit_message_text; si no, reply_text
     if getattr(update, "callback_query", None):
         query = update.callback_query
-        # Responder al callback para quitar la "carga" en el cliente
         try:
             await query.answer()
-        except Exception as e:
-            # Ignorar callbacks expirados / inválidos; loguear en debug
-            logging.debug(f"Ignored query.answer() error: {e}")
-        # Intentar editar el mensaje original; si falla, enviar uno nuevo
+        except Exception:
+            pass
         try:
             await query.edit_message_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception:
             await context.bot.send_message(chat_id=query.from_user.id, text=mensaje, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+
+# Handler para mostrar combos en el menú principal
+async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa la compra de un combo identificado por callback_data `comprar_combo_{i}`."""
+    query = update.callback_query
+    if not query:
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    data = (query.data or "")
+    if not data.startswith("comprar_combo_"):
+        await query.edit_message_text("❌ Callback inválido para comprar combo.")
+        return
+
+    try:
+        idx = int(data.split("_")[-1])
+    except Exception:
+        await query.edit_message_text("❌ Índice de combo inválido.")
+        return
+
+    if idx < 0 or idx >= len(combos):
+        await query.edit_message_text("❌ Combo no encontrado.")
+        return
+
+    combo = combos[idx]
+    plataformas = combo.get('plataformas', [])
+    precio_combo = float(combo.get('precio', 0.0))
+
+    if not plataformas:
+        await query.edit_message_text("❌ Este combo no tiene plataformas definidas.")
+        return
+
+    user_id = query.from_user.id
+    inicializar_usuario(user_id)
+
+    if clientes.get(user_id, 0.0) < precio_combo:
+        await query.edit_message_text(f"❌ Saldo insuficiente. Necesitas ${precio_combo:.2f} y tienes ${clientes.get(user_id,0):.2f}.")
+        return
+
+    simulated = load_stock()
+    selects = []  # (plataforma, tipo, precio) elegidos
+    for plat in plataformas:
+        plat_lower = plat.strip().lower()
+        found = False
+        for i, row in enumerate(simulated):
+            if not row or len(row) < 5:
+                continue
+            row_platform = (row[0] or "").strip().lower()
+            if row_platform != plat_lower:
+                continue
+            if len(row) >= 7:
+                try:
+                    perfiles_disponibles = int(row[5])
+                except Exception:
+                    continue
+                if perfiles_disponibles <= 0:
+                    continue
+                precio = 0.0
+                try:
+                    precio = float(str(row[4]).strip())
+                except Exception:
+                    pass
+                selects.append((row[0].strip(), row[1].strip(), precio))
+                if perfiles_disponibles > 1:
+                    simulated[i][5] = str(perfiles_disponibles - 1)
+                    if len(simulated[i]) > 6 and simulated[i][6].isdigit():
+                        simulated[i][6] = str(int(simulated[i][6]) + 1)
+                    else:
+                        while len(simulated[i]) < 7:
+                            simulated[i].append("1")
+                        simulated[i][6] = "2"
+                else:
+                    del simulated[i]
+                found = True
+                break
+            else:
+                precio = 0.0
+                try:
+                    precio = float(str(row[4]).strip())
+                except Exception:
+                    pass
+                selects.append((row[0].strip(), row[1].strip(), precio))
+                del simulated[i]
+                found = True
+                break
+        # Reemplazar este bloque dentro de handle_comprar_combo (donde se detecta que no hay stock para `plat`)
+    if not found:
+        no_stock_text = f"❌ Lo siento, ya no hay stock de *{plat}* para completar este combo."
+        back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+        await query.edit_message_text(no_stock_text, reply_markup=back_markup, parse_mode="Markdown")
+        return
+
+    entregados = []
+    for platform, tipo, precio_item in selects:
+        res = entregar_cuenta(platform, tipo, precio_item)
+        if not res:
+            await query.edit_message_text("❌ No se pudo completar la compra por cambio de stock. Intenta de nuevo.")
+            return
+        entregados.append(res)
+
+    clientes[user_id] -= precio_combo
+    guardar_clientes()
+
+    id_compra = str(uuid.uuid4()).split('-')[0].upper()
+    n_items = len(entregados)
+    precio_por_item = round(precio_combo / n_items, 2) if n_items else 0.0
+
+    for entrega in entregados:
+        plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
+        # registrar incluyendo la plataforma en el plan para claridad en logs
+        log_compra(user_id, f"{combo.get('titulo','Combo')} - {plat_entregado} - {plan_entregado}", correo, password, precio_por_item, id_compra)
+
+    # Construir mensaje de entrega: mostrar categoría simple ('perfil' o 'completa') en lugar de "perfil (N)"
+    mensaje = (
+        f"🎉 ¡Compra del combo *{combo.get('titulo','Combo')}* realizada!\n"
+        f"🆔 ID de Compra: `{id_compra}`\n"
+        f"💲 Precio total: ${precio_combo:.2f}\n\n"
+        "📦 Cuentas entregadas:\n"
+    )
+    for entrega in entregados:
+        plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
+        # Normalizar display de tipo: preferir la categoría en lugar de la descripción con número
+        plan_lower = (plan_entregado or "").lower()
+        if 'perfil' in plan_lower and 'completa' not in plan_lower:
+            display_plan = 'perfil'
+        elif 'completa' in plan_lower and 'perfil' not in plan_lower:
+            display_plan = 'completa'
+        else:
+            display_plan = plan_entregado or 'otro'
+
+        perfil_text = "Cuenta Completa" if perfil_entregado == 0 else f"Perfil {perfil_entregado}"
+        mensaje += f"• {plat_entregado} — {display_plan} — {perfil_text}\n   Correo: `{correo}`\n   Contraseña: `{password}`\n\n"
+
+    # Añadir garantía y cierre
+    mensaje += f"🛡️ Garantía: {GARANTIA_DIAS} días\n\n"
+    mensaje += "¡Gracias por tu compra! Guarda el ID de compra para cualquier reporte."
+
+    try:
+        await context.bot.send_message(chat_id=user_id, text=mensaje, parse_mode="Markdown")
+        try:
+            await query.edit_message_text("✅ Compra realizada. Revisa tu chat privado para los detalles.")
+        except Exception:
+            pass
+    except Exception:
+        try:
+            await query.edit_message_text("✅ Compra realizada. Revisa tu chat privado para los detalles.")
+        except Exception:
+            pass
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"✅ Combo vendido: {combo.get('titulo')} a {user_id} | ID {id_compra}")
+    except Exception:
+        logging.debug("No se pudo notificar al admin sobre la venta del combo.")
 
 async def ver_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/verclientes - Muestra la lista de clientes con su ID y saldo (solo Admin)."""
@@ -1548,42 +2551,205 @@ async def ver_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mensaje += f"ID: `{cid}` | Saldo: ${saldo:.2f}\n"
     await update.message.reply_text(mensaje, parse_mode="Markdown")
 
+# Persistir inmediatamente cuando se crea un combo (texto)
+async def addcombo_plataformas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    if texto.lower() == 'listo':
+        combo = context.user_data.get('nuevo_combo', {})
+        combos.append(combo)
+        save_combos_csv()  # Persistir al crear por texto
+        await update.message.reply_text(
+            f"✅ Combo creado:\n*{combo.get('titulo','Sin título')}* ({combo.get('subnombre','')})\nPrecio: ${float(combo.get('precio',0.0)):.2f}\nPlataformas: {', '.join(combo.get('plataformas',[]))}",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    else:
+        context.user_data.setdefault('nuevo_combo', {})
+        context.user_data['nuevo_combo'].setdefault('plataformas', [])
+        context.user_data['nuevo_combo']['plataformas'].append(texto)
+        await update.message.reply_text("Agrega otra plataforma o escribe 'listo' para terminar:")
+
+async def reporte_fecha_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 4: Recibe la fecha, la normaliza a DD/MM/AAAA y pide la descripción del problema."""
+    user_id = update.message.from_user.id
+    fecha_input = (update.message.text or "").strip()
+
+    # Intentar normalizar/parsear distintos formatos automáticos
+    fecha_norm = _normalize_fecha_input(fecha_input)
+    if not fecha_norm:
+        await update.message.reply_text(
+            "❌ Fecha inválida. Envía la fecha en formato DD/MM/AAAA.\n"
+            "Ejemplos válidos: `01/01/2025`, `01012025`, `01-01-2025`.\n"
+            "Intenta nuevamente:",
+            parse_mode="Markdown"
+        )
+        return REPORTE_FECHA
+
+    # Guardar fecha normalizada
+    tmp_reporte[user_id]['fecha_compra'] = fecha_norm
+
+    await update.message.reply_text(
+        "📝 Describe detalladamente el problema que presenta la cuenta. Si tienes una captura de pantalla, ¡puedes enviarla ahora mismo junto con tu texto!",
+        parse_mode="Markdown"
+    )
+    return REPORTE_DESCRIPCION
+
+
+
+async def reporte_pass_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 3: Recibe y valida la contraseña."""
+    user_id = update.message.from_user.id
+    password = update.message.text.strip()
+    if not password:
+        await update.message.reply_text("❌ La contraseña no puede estar vacía. Intenta nuevamente:")
+        return REPORTE_PASS
+
+    tmp_reporte[user_id]['pass'] = password
+
+    # Instrucción clara y ejemplo práctico; indicar que puede escribir sin '/' y se formatea
+    await update.message.reply_text(
+        "Ingresa la fecha en que compraste esta cuenta (Formato: DD/MM/AAAA).\n"
+        "Puedes escribir por ejemplo: 01/01/2025 o 01012025 — la fecha se normalizará automáticamente.",
+        parse_mode="Markdown"
+    )
+    return REPORTE_FECHA
+
+async def reporte_correo_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 2: Recibe el correo del reporte. Valida formato básico de email."""
+    user_id = update.message.from_user.id
+    correo = update.message.text.strip()
+    if not correo:
+        await update.message.reply_text("❌ El correo no puede estar vacío. Intenta nuevamente:")
+        return REPORTE_CORREO
+
+    # Validación simple de correo (básica, no exhaustiva)
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", correo):
+        await update.message.reply_text("❌ Formato de correo inválido. Ejemplo válido: usuario@dominio.com. Intenta nuevamente:")
+        return REPORTE_CORREO
+
+    tmp_reporte[user_id]['correo'] = correo
+    await update.message.reply_text("Ingresa la contraseña de la cuenta:", parse_mode="Markdown")
+    return REPORTE_PASS
+
+async def eliminar_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/eliminarcliente <ID> - Elimina un cliente del archivo de clientes (solo Admin).
+    No toca otros archivos ni código."""
+    user_id = update.message.from_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Solo el administrador puede usar este comando.")
+        return
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("❌ Uso: /eliminarcliente <ID_USUARIO>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido. Debe ser un número entero.")
+        return
+
+    if target_id not in clientes:
+        await update.message.reply_text(f"❌ El cliente con ID {target_id} no existe en el registro.")
+        return
+
+    # Eliminar del dict y persistir
+    try:
+        del clientes[target_id]
+        guardar_clientes()
+        await update.message.reply_text(f"✅ Cliente ID {target_id} eliminado de {CSV_CLIENTES}. No se borró ningún otro archivo ni código.")
+        # opcional: notificar al usuario (intento silencioso)
+        try:
+            await context.bot.send_message(chat_id=target_id, text="⚠️ Tu cuenta de cliente ha sido eliminada por el administrador.")
+        except Exception:
+            logging.debug(f"No se pudo notificar al cliente {target_id} sobre su eliminación.")
+    except Exception as e:
+        logging.exception(f"Error eliminando cliente {target_id}: {e}")
+        await update.message.reply_text("❌ Error al intentar eliminar el cliente. Revisa los logs.")
+
+    # Aquí podríamos preguntar si se desea eliminar también el historial de compras...
+    # pero eso podría ser destructivo. Mejor que el admin lo haga manualmente si es necesario.
+
 def main():
-    """Configuración principal del bot."""
+    """Configuración principal del bot y registro de handlers."""
     cargar_clientes()
+    load_combos_csv()
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Handler para agregar combos
-    addcombo_handler = ConversationHandler(
-    entry_points=[CommandHandler('addcombo', addcombo_start)],
-    states={
-        ADD_COMBO_TITULO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_titulo)],
-        ADD_COMBO_SUBNOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_subnombre)],
-        ADD_COMBO_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_precio)],
-        ADD_COMBO_PLATAFORMAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_plataformas)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel)],
-)
-    application.add_handler(addcombo_handler)
-    application.add_handler(CallbackQueryHandler(show_combos_menu, pattern='^show_combos_menu$'))
-    application.add_handler(CommandHandler("combos", show_combos_menu))
-    application.add_handler(CommandHandler("verclientes", ver_clientes))
 
-    # Comandos generales
+    # Conversation handler: combos
+    addcombo_handler = ConversationHandler(
+        entry_points=[CommandHandler('addcombo', addcombo_start)],
+        states={
+            ADD_COMBO_TITULO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_titulo)],
+            ADD_COMBO_SUBNOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_subnombre)],
+            ADD_COMBO_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_precio)],
+            ADD_COMBO_PLATAFORMAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_plataformas)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    application.add_handler(addcombo_handler)
+
+        # Comandos generales
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("saldo", saldo))
     application.add_handler(CommandHandler("comandos", comandos))
     application.add_handler(CommandHandler("historial", historial))
     application.add_handler(CommandHandler("cancel", cancel))
-    
-    # Comandos de administrador
+    application.add_handler(CommandHandler("combos", show_combos_menu))
+    application.add_handler(CommandHandler("verclientes", ver_clientes))
+    ...
+    # Navegación y compra
+    application.add_handler(CallbackQueryHandler(show_combos_menu, pattern='^show_combos_menu$'))
+    application.add_handler(CallbackQueryHandler(show_categories, pattern='^show_categories$'))
+    application.add_handler(CallbackQueryHandler(show_plataformas, pattern='^category_(completa|perfil)$'))
+    application.add_handler(CallbackQueryHandler(handle_platform_selection, pattern='^select_(completa|perfil)_.*'))
+    application.add_handler(CallbackQueryHandler(handle_compra_final, pattern='^buy_.*'))
+    # Handler para comprar combos (cada botón produce comprar_combo_{i})
+    application.add_handler(CallbackQueryHandler(handle_comprar_combo, pattern=r'^comprar_combo_\d+$'))
+
+    # Comandos admin
     application.add_handler(CommandHandler("stock", stock_check))
     application.add_handler(CommandHandler("recargar", recargar))
     application.add_handler(CommandHandler("quitarsaldo", quitar_saldo))
     application.add_handler(CommandHandler("consultarsaldo", consultar_saldo))
-    application.add_handler(CommandHandler("responder", responder))  # <-- AÑADIR AQUÍ
+    application.add_handler(CommandHandler("responder", responder))
+    application.add_handler(CommandHandler("eliminarcliente", eliminar_cliente))
+    application.add_handler(CommandHandler("borrarventa", borrar_venta))
 
-    # Flujo de agregar venta (Admin)
+        # Conversation handler: combos
+    addcombo_handler = ConversationHandler(
+        entry_points=[CommandHandler('addcombo', addcombo_start)],
+        states={
+            ADD_COMBO_TITULO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_titulo)],
+            ADD_COMBO_SUBNOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_subnombre)],  # CORRECCIÓN: nombre correcto
+            ADD_COMBO_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_precio)],
+            # En el estado de plataformas aceptamos texto y callbacks (botones de stock)
+            ADD_COMBO_PLATAFORMAS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_plataformas),
+                CallbackQueryHandler(addcombo_platform_callback, pattern=r'^addcombo_plat_.*'),
+                CallbackQueryHandler(addcombo_finish_callback, pattern=r'^addcombo_done$'),
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    application.add_handler(addcombo_handler)
+
+    # Flujo reporte (Conversation)
+    reporte_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(reporte_start, pattern='^iniciar_reporte$')],
+        states={
+            REPORTE_ID_COMPRA: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_id_compra_recibida)],
+            REPORTE_CORREO: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_correo_recibida)],
+            REPORTE_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_pass_recibida)],
+            REPORTE_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_fecha_recibida)],
+            REPORTE_DESCRIPCION: [MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, reporte_descripcion_recibida)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    application.add_handler(reporte_handler)
+
+        # Flujo agregar venta (Conversation)
     addventa_handler = ConversationHandler(
         entry_points=[CommandHandler('addventa', addventa)],
         states={
@@ -1592,131 +2758,32 @@ def main():
             AGREGAR_CORREO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_correo)],
             AGREGAR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_pass)],
             AGREGAR_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_precio)],
+            AGREGAR_MATERIAL: [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, guardar_material_perfil)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     application.add_handler(addventa_handler)
-    
-    # Flujo de reporte (Usuario)
-    reporte_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(reporte_start, pattern='^iniciar_reporte$')],
-        states={
-            REPORTE_ID_COMPRA: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_id_compra_recibida)],
-            REPORTE_CORREO: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_correo_recibida)],
-            REPORTE_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_pass_recibida)],
-            REPORTE_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, reporte_fecha_recibida)],
-            REPORTE_DESCRIPCION: [MessageHandler(filters.TEXT | filters.PHOTO & ~filters.COMMAND, reporte_descripcion_recibida)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-    )
-    application.add_handler(reporte_handler)
 
-    # Handlers de Compra
-    application.add_handler(CallbackQueryHandler(show_categories, pattern='^show_categories$')) 
-    application.add_handler(CallbackQueryHandler(show_plataformas, pattern='^category_(completa|perfil)$')) 
-    application.add_handler(CallbackQueryHandler(handle_platform_selection, pattern='^select_(completa|perfil)_.*')) 
-    application.add_handler(CallbackQueryHandler(handle_compra_final, pattern='^buy_.*')) 
-    
-    # Handlers de Combos
-    application.add_handler(CommandHandler("addcombo", addcombo_start))
-    application.add_handler(CommandHandler("combos", show_combos_menu))
-    
-    # Handlers Varios
-    application.add_handler(CallbackQueryHandler(show_main_menu, pattern='^empezar$'))
-    application.add_handler(CallbackQueryHandler(show_categories, pattern='^comprar$')) # Redirige el viejo 'comprar' al nuevo menú de categorías
-    application.add_handler(CallbackQueryHandler(show_recarga_info, pattern='^mostrar_recarga$', block=False))
-    
-    # Lógica de borrado de stock
-    application.add_handler(CommandHandler("borrarventa", borrar_venta))
+     # Navegación y compra
+    application.add_handler(CallbackQueryHandler(show_combos_menu, pattern='^show_combos_menu$'))
+    application.add_handler(CallbackQueryHandler(show_categories, pattern='^show_categories$'))
+    application.add_handler(CallbackQueryHandler(show_plataformas, pattern='^category_(completa|perfil)$'))
+    application.add_handler(CallbackQueryHandler(handle_platform_selection, pattern='^select_(completa|perfil)_.*'))
+    application.add_handler(CallbackQueryHandler(handle_compra_final, pattern='^buy_.*'))
+    # Handler para comprar combos (cada botón produce comprar_combo_{i})
+    application.add_handler(CallbackQueryHandler(handle_comprar_combo, pattern=r'^comprar_combo_\d+$'))
+     # Mostrar información de recarga (botón del menú)
+    application.add_handler(CallbackQueryHandler(show_recarga_info, pattern=r'^mostrar_recarga$'))
+    # Volver al menú (botón "empezar")
+    application.add_handler(CallbackQueryHandler(volver_al_menu_callback, pattern=r'^empezar$'))
+
+    # Borrado / respuestas admin
     application.add_handler(CallbackQueryHandler(borrar_venta, pattern='^borrar_venta_menu$'))
     application.add_handler(CallbackQueryHandler(mostrar_lista_borrar, pattern='^borrar_(completa|perfil|otro)$'))
-    application.add_handler(MessageHandler(filters.TEXT & filters.Chat(ADMIN_ID), borrar_stock_por_indice)) 
+    application.add_handler(MessageHandler(filters.Regex(r'^\d+$') & filters.Chat(ADMIN_ID), borrar_stock_por_indice))
     application.add_handler(MessageHandler(filters.PHOTO & filters.Chat(ADMIN_ID), responder_foto))
 
-    # Nuevo handler para la compra de combos
-    async def handle_combo_compra(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        user_id = query.from_user.id
-        inicializar_usuario(user_id)
-
-        try:
-            index = int(query.data.split('_')[-1])
-        except Exception as e:
-            logging.exception(f"handle_combo_compra: índice inválido en callback_data '{query.data}': {e}")
-            await query.edit_message_text("❌ Error interno. Intenta de nuevo.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]))
-            return
-
-        if index < 0 or index >= len(combos):
-            await query.edit_message_text("❌ Combo no encontrado.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]))
-            return
-
-        combo = combos[index]
-        precio = float(combo.get('precio', 0.0))
-
-        if clientes[user_id] < precio:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"❌ Saldo insuficiente. Necesitas ${precio:.2f} y solo tienes ${clientes[user_id]:.2f}.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Recargar saldo", callback_data="mostrar_recarga")], [InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]),
-                parse_mode="Markdown"
-            )
-            return
-
-        # Descontar y registrar la compra
-        clientes[user_id] -= precio
-        guardar_clientes()
-        id_compra = str(uuid.uuid4()).split('-')[0].upper()
-        log_compra(user_id, combo.get('titulo', 'Combo'), "N/A", "N/A", precio, id_compra)
-
-        logging.info(f"Entrega combo preparada: combo_index={index}, user_id={user_id}, precio={precio:.2f}, saldo_restante={clientes[user_id]:.2f}, id_compra={id_compra}")
-
-        mensaje_entrega = (
-            "🎉 ¡Tu combo ha sido entregado! 🎉\n"
-            "--------------------------------------\n"
-            f"➡️ Combo: {combo.get('titulo','N/A')}\n"
-            f"➡️ Descripción: {combo.get('subnombre','')}\n"
-            f"➡️ Plataformas: {', '.join(combo.get('plataformas', []))}\n"
-            f"➡️ Costo: ${precio:.2f}\n"
-            "--------------------------------------\n"
-            f"🛡️ Garantía: {GARANTIA_DIAS} días\n"
-            f"🆔 ID de Compra: {id_compra}\n"
-            "Guarda este ID para cualquier reporte. ¡Disfruta!\n"
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=mensaje_entrega,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logging.exception(f"Error enviando mensaje de entrega al usuario {user_id}: {e}")
-            try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Error enviando entrega de combo a {user_id}: {e}")
-            except Exception:
-                logging.exception("No se pudo notificar al admin sobre el fallo de entrega de combo.")
-
-        # Envío de material adjunto por plataforma (si existe)
-        for plataforma in combo.get('plataformas', []):
-            # Nombre de material específico para combos (no usar variables de compra individual)
-            material_filename = f"material_{plataforma}_combo.jpg"
-            if os.path.exists(material_filename):
-                try:
-                    with open(material_filename, 'rb') as mf:
-                        await context.bot.send_document(
-                            chat_id=user_id,
-                            document=mf,
-                            caption=f"Material para {plataforma} en tu combo"
-                        )
-                except Exception as e:
-                    logging.exception(f"No se pudo enviar material '{material_filename}' a {user_id}: {e}")
-                    # continuar con otras plataformas
-
-        await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
-
-    application.add_handler(CallbackQueryHandler(handle_combo_compra, pattern='^comprar_combo_\\d+$'))
-
+    # Ejecutar
     application.run_polling()
 
 if __name__ == '__main__':
