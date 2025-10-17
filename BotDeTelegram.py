@@ -21,13 +21,40 @@ logging.basicConfig(
 )
 
 # --- Configuración y Almacenamiento de Datos ---
-# NOTA: Cambia este token por el real si lo vas a ejecutar
-TOKEN = "8457617126:AAEkkALVR7eHegeuoDYXElWS54msmaBM5ok"  # Reemplaza con tu token real de Telegram
-if not TOKEN:
-    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno")
+# Cargar .env simple (opcional) sin depender de python-dotenv
+def _load_dotenv_simple(path: str = '.env'):
+    """Carga variables KEY=VALUE desde .env hacia os.environ sin sobrescribir las existentes."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k, v)
+    except Exception as e:
+        logging.warning(f"No se pudo leer {path}: {e}")
 
-# 🚨 ID del Administrador FIJA
-ADMIN_ID = 7006777962 
+# Intentar cargar .env local (si existe)
+_load_dotenv_simple()
+
+# Leer TOKEN desde variable de entorno
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno. Define TELEGRAM_TOKEN.")
+
+# Leer ADMIN_ID desde variable de entorno y convertir a int
+_admin_id_raw = os.getenv("ADMIN_ID")
+if not _admin_id_raw:
+    raise RuntimeError("Falta ADMIN_ID en variables de entorno. Define ADMIN_ID.")
+try:
+    ADMIN_ID = int(_admin_id_raw)
+except ValueError:
+    raise RuntimeError("ADMIN_ID debe ser un número entero. Revisa la variable de entorno ADMIN_ID.")
 
 # Archivos de persistencia
 CSV_CLIENTES = 'clientes.csv'
@@ -1499,10 +1526,11 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if clientes[user_id] < precio_final:
+    prev_balance = clientes.get(user_id, 0.0)
+    if prev_balance < precio_final:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"❌ Saldo insuficiente. Necesitas ${precio_final:.2f} y solo tienes ${clientes[user_id]:.2f}.",
+            text=f"❌ Saldo insuficiente. Necesitas ${precio_final:.2f} y solo tienes ${prev_balance:.2f}.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Recargar saldo", callback_data="mostrar_recarga")], [InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]),
             parse_mode="Markdown"
         )
@@ -1538,6 +1566,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Descontar saldo 
     clientes[user_id] -= precio_final 
     guardar_clientes()
+    remaining = clientes[user_id]
 
     # Generar ID de Compra
     id_compra = str(uuid.uuid4()).split('-')[0].upper() # Genera un ID corto y aleatorio
@@ -1546,21 +1575,30 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     log_compra(user_id, plan_entregado, correo, password, precio_final, id_compra)
 
     # 4. Enviar cuenta al usuario (NUEVO MENSAJE)
-    logging.info(f"Entrega preparada: cuenta_data={cuenta_data}, user_id={user_id}, precio={precio_final:.2f}, saldo_restante={clientes[user_id]:.2f}, id_compra={id_compra}")
+    logging.info(f"Entrega preparada: cuenta_data={cuenta_data}, user_id={user_id}, precio={precio_final:.2f}, saldo_restante={remaining:.2f}, id_compra={id_compra}")
 
-    perfil_text = "Cuenta Completa" if perfil_entregado == 0 else f"Perfil {perfil_entregado}"
+    # Perfil / dispositivos
+    if perfil_entregado == 0:
+        perfil_text = "Cuenta Completa"
+        dispositivos_text = "Todos los dispositivos"
+    else:
+        perfil_text = f"Perfil {perfil_entregado}"
+        dispositivos_text = "1 dispositivo"
+
     mensaje_entrega = (
         "🎉 ¡Tu cuenta ha sido entregada! 🎉\n"
         "--------------------------------------\n"
         f"➡️ Plataforma: {platform}\n"
-        f"➡️ Tipo: {plan_entregado}\n"
         f"➡️ Correo: {correo}\n"
         f"➡️ Contraseña: {password}\n"
         f"➡️ Perfil asignado: {perfil_text}\n"
+        f"➡️ Dispositivos: {dispositivos_text}\n"
         f"➡️ Costo: ${precio_final:.2f}\n"
         "--------------------------------------\n"
         f"🛡️ Garantía: {GARANTIA_DIAS} días\n"
-        f"🆔 ID de Compra: {id_compra}\n"
+        f"🆔 ID de Compra: {id_compra}\n\n"
+        f"🔻 Se descontó: ${precio_final:.2f}\n"
+        f"💳 Saldo restante: ${remaining:.2f}\n\n"
         "Guarda este ID para cualquier reporte. ¡Disfruta!\n"
     )
 
@@ -1595,10 +1633,6 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 5. Abrir automáticamente el menú principal (NUEVO MENSAJE)
     await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
-
-
-# --- Funciones de Menú y Redirección ---
-
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, welcome_msg="Elige una opción:"):
     user = update.effective_user
     if not user:
@@ -2416,8 +2450,9 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = query.from_user.id
     inicializar_usuario(user_id)
 
-    if clientes.get(user_id, 0.0) < precio_combo:
-        await query.edit_message_text(f"❌ Saldo insuficiente. Necesitas ${precio_combo:.2f} y tienes ${clientes.get(user_id,0):.2f}.")
+    prev_balance = clientes.get(user_id, 0.0)
+    if prev_balance < precio_combo:
+        await query.edit_message_text(f"❌ Saldo insuficiente. Necesitas ${precio_combo:.2f} y tienes ${prev_balance:.2f}.")
         return
 
     simulated = load_stock()
@@ -2466,12 +2501,11 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
                 del simulated[i]
                 found = True
                 break
-        # Reemplazar este bloque dentro de handle_comprar_combo (donde se detecta que no hay stock para `plat`)
-    if not found:
-        no_stock_text = f"❌ Lo siento, ya no hay stock de *{plat}* para completar este combo."
-        back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
-        await query.edit_message_text(no_stock_text, reply_markup=back_markup, parse_mode="Markdown")
-        return
+        if not found:
+            no_stock_text = f"❌ Lo siento, ya no hay stock de *{plat}* para completar este combo."
+            back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+            await query.edit_message_text(no_stock_text, reply_markup=back_markup, parse_mode="Markdown")
+            return
 
     entregados = []
     for platform, tipo, precio_item in selects:
@@ -2481,8 +2515,10 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         entregados.append(res)
 
+    # Descontar saldo total y persistir
     clientes[user_id] -= precio_combo
     guardar_clientes()
+    remaining = clientes[user_id]
 
     id_compra = str(uuid.uuid4()).split('-')[0].upper()
     n_items = len(entregados)
@@ -2493,7 +2529,7 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
         # registrar incluyendo la plataforma en el plan para claridad en logs
         log_compra(user_id, f"{combo.get('titulo','Combo')} - {plat_entregado} - {plan_entregado}", correo, password, precio_por_item, id_compra)
 
-    # Construir mensaje de entrega: mostrar categoría simple ('perfil' o 'completa') en lugar de "perfil (N)"
+    # Construir mensaje de entrega: mostrar cada ítem con perfil y dispositivos
     mensaje = (
         f"🎉 ¡Compra del combo *{combo.get('titulo','Combo')}* realizada!\n"
         f"🆔 ID de Compra: `{id_compra}`\n"
@@ -2502,7 +2538,6 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     for entrega in entregados:
         plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
-        # Normalizar display de tipo: preferir la categoría en lugar de la descripción con número
         plan_lower = (plan_entregado or "").lower()
         if 'perfil' in plan_lower and 'completa' not in plan_lower:
             display_plan = 'perfil'
@@ -2511,11 +2546,24 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             display_plan = plan_entregado or 'otro'
 
-        perfil_text = "Cuenta Completa" if perfil_entregado == 0 else f"Perfil {perfil_entregado}"
-        mensaje += f"• {plat_entregado} — {display_plan} — {perfil_text}\n   Correo: `{correo}`\n   Contraseña: `{password}`\n\n"
+        if perfil_entregado == 0:
+            perfil_text = "Cuenta Completa"
+            dispositivos_text = "Todos los dispositivos"
+        else:
+            perfil_text = f"Perfil {perfil_entregado}"
+            dispositivos_text = "1 dispositivo"
 
-    # Añadir garantía y cierre
+        mensaje += (
+            f"• {plat_entregado} — {display_plan} — {perfil_text}\n"
+            f"   Dispositivos: {dispositivos_text}\n"
+            f"   Correo: `{correo}`\n"
+            f"   Contraseña: `{password}`\n\n"
+        )
+
+    # Añadir garantía, descuento y saldo restante
     mensaje += f"🛡️ Garantía: {GARANTIA_DIAS} días\n\n"
+    mensaje += f"🔻 Se descontó: ${precio_combo:.2f}\n"
+    mensaje += f"💳 Saldo restante: ${remaining:.2f}\n\n"
     mensaje += "¡Gracias por tu compra! Guarda el ID de compra para cualquier reporte."
 
     try:
