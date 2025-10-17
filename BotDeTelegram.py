@@ -1,4 +1,4 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup,Bot
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, ContextTypes,
     CommandHandler, ConversationHandler, MessageHandler, filters
@@ -2722,6 +2722,14 @@ def main():
     """Configuración principal del bot y registro de handlers."""
     cargar_clientes()
     load_combos_csv()
+
+    # Eliminar webhook si existe (solo para polling, no afecta a webhooks en producción)
+    try:
+        Bot(TOKEN).delete_webhook()
+        logging.info("Webhook eliminado (si existía).")
+    except Exception as e:
+        logging.warning(f"No se pudo eliminar webhook: {e}")
+
     application = ApplicationBuilder().token(TOKEN).build()
 
 
