@@ -1578,9 +1578,12 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     logging.info(f"Entrega preparada: cuenta_data={cuenta_data}, user_id={user_id}, precio={precio_final:.2f}, saldo_restante={remaining:.2f}, id_compra={id_compra}")
 
     # Perfil / dispositivos
+    # Para cuentas completas queremos mostrar que se entregaron "Todos los perfiles"
+    # y que el cliente obtiene "1 dispositivo por perfil". Para cuentas por perfil
+    # mantenemos el comportamiento anterior.
     if perfil_entregado == 0:
-        perfil_text = "Cuenta Completa"
-        dispositivos_text = "Todos los dispositivos"
+        perfil_text = "Todos los perfiles"
+        dispositivos_text = "1 dispositivo por perfil"
     else:
         perfil_text = f"Perfil {perfil_entregado}"
         dispositivos_text = "1 dispositivo"
@@ -1591,7 +1594,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"➡️ Plataforma: {platform}\n"
         f"➡️ Correo: {correo}\n"
         f"➡️ Contraseña: {password}\n"
-        f"➡️ Perfil asignado: {perfil_text}\n"
+        f"➡️ Perfiles asignados: {perfil_text}\n"
         f"➡️ Dispositivos: {dispositivos_text}\n"
         f"➡️ Costo: ${precio_final:.2f}\n"
         "--------------------------------------\n"
@@ -1633,6 +1636,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 5. Abrir automáticamente el menú principal (NUEVO MENSAJE)
     await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
+
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, welcome_msg="Elige una opción:"):
     user = update.effective_user
     if not user:
@@ -2526,16 +2530,29 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     for entrega in entregados:
         plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
-        # registrar incluyendo la plataforma en el plan para claridad en logs
-        log_compra(user_id, f"{combo.get('titulo','Combo')} - {plat_entregado} - {plan_entregado}", correo, password, precio_por_item, id_compra)
+        plan_lower = (plan_entregado or "").lower()
+        if 'perfil' in plan_lower and 'completa' not in plan_lower:
+            display_plan = 'perfil'
+        elif 'completa' in plan_lower and 'perfil' not in plan_lower:
+            display_plan = 'completa'
+        else:
+            display_plan = plan_entregado or 'otro'
 
-    # Construir mensaje de entrega: mostrar cada ítem con perfil y dispositivos
-    mensaje = (
-        f"🎉 ¡Compra del combo *{combo.get('titulo','Combo')}* realizada!\n"
-        f"🆔 ID de Compra: `{id_compra}`\n"
-        f"💲 Precio total: ${precio_combo:.2f}\n\n"
-        "📦 Cuentas entregadas:\n"
-    )
+        # Ajuste: para cuentas completas mostrar "Todos los perfiles" y
+        # "1 dispositivo por perfil"; para perfiles individuales mantener "Perfil N" y "1 dispositivo".
+        if perfil_entregado == 0:
+            perfil_text = "Todos los perfiles"
+            dispositivos_text = "1 dispositivo por perfil"
+        else:
+            perfil_text = f"Perfil {perfil_entregado}"
+            dispositivos_text = "1 dispositivo"
+
+        mensaje += (
+            f"• {plat_entregado} — {display_plan} — {perfil_text}\n"
+            f"   Dispositivos: {dispositivos_text}\n"
+            f"   Correo: `{correo}`\n"
+            f"   Contraseña: `{password}`\n\n"
+        )
     for entrega in entregados:
         plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
         plan_lower = (plan_entregado or "").lower()
