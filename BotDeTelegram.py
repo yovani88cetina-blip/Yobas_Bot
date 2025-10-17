@@ -1,10 +1,13 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup,Bot
+#listo solo agregar cositas
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, ContextTypes,
     CommandHandler, ConversationHandler, MessageHandler, filters
 )
 import csv
 import logging
+# Añade junto a los otros imports al principio del archivo
+import tempfile
 import os 
 import uuid
 from collections import defaultdict
@@ -21,40 +24,13 @@ logging.basicConfig(
 )
 
 # --- Configuración y Almacenamiento de Datos ---
-# Cargar .env simple (opcional) sin depender de python-dotenv
-def _load_dotenv_simple(path: str = '.env'):
-    """Carga variables KEY=VALUE desde .env hacia os.environ sin sobrescribir las existentes."""
-    if not os.path.exists(path):
-        return
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                k, v = line.split('=', 1)
-                k = k.strip()
-                v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k, v)
-    except Exception as e:
-        logging.warning(f"No se pudo leer {path}: {e}")
-
-# Intentar cargar .env local (si existe)
-_load_dotenv_simple()
-
-# Leer TOKEN desde variable de entorno
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+# NOTA: Cambia este token por el real si lo vas a ejecutar
+TOKEN = "8457617126:AAEdPH19IauKchKifhq3qGyPKRgMWJaX-k0"  # Reemplaza con tu token real de Telegram
 if not TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno. Define TELEGRAM_TOKEN.")
+    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno")
 
-# Leer ADMIN_ID desde variable de entorno y convertir a int
-_admin_id_raw = os.getenv("ADMIN_ID")
-if not _admin_id_raw:
-    raise RuntimeError("Falta ADMIN_ID en variables de entorno. Define ADMIN_ID.")
-try:
-    ADMIN_ID = int(_admin_id_raw)
-except ValueError:
-    raise RuntimeError("ADMIN_ID debe ser un número entero. Revisa la variable de entorno ADMIN_ID.")
+# 🚨 ID del Administrador FIJA
+ADMIN_ID = 7006777962 
 
 # Archivos de persistencia
 CSV_CLIENTES = 'clientes.csv'
@@ -671,21 +647,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Definir textos de comandos aquí para usarlos en la bienvenida
     admin_comandos = (
         "👑 *Comandos de Administrador:*\n"
+        "------------------------------------\n"
         "/start - Iniciar el bot y ver el menú principal.\n"
         "/saldo - Ver tu saldo.\n"
         "/comandos - Muestra esta lista.\n"
         "/stock - Ver el inventario detallado de cuentas.\n"
-        "/addventa <Plataforma> - Agregar cuenta al stock.\n"
-        "/borrarventa - Eliminar cuenta del stock.\n"
+        "/addventa <Plataforma> - Iniciar el flujo para agregar una cuenta al stock.\n"
+        "/borrarventa - Iniciar el flujo para eliminar una cuenta del stock o combos.\n"
         "/recargar <ID> <monto> - Recarga saldo a un usuario.\n"
         "/quitarsaldo <ID> <monto> - Descuenta saldo a un usuario.\n"
-        "/consultarsaldo <ID> - Consulta saldo de un usuario.\n"
-        "/historial - Obtén el CSV de tu historial de compras.\n"
-        "/cancel - Cancela un flujo de conversación.\n"
-        "/addcombo - Inicia flujo para agregar combos.\n"
-        "/combos - Muestra combos disponibles.\n"
-        "/verclientes - Muestra lista de clientes.\n"
-        "/responder <ID> <mensaje> - Enviar mensaje a cliente.\n"
+        "/consultarsaldo <ID> - Consulta el saldo de un usuario específico.\n"
+        "/historial - Obtén el CSV con el historial de tus compras o para ver el de tus clientes /historial <id>.\n"
+        "/cancel - Cancela un flujo de conversación (e.g., /addventa, /borrarventa o Reporte).\n"
+        "/addcombo - Inicia el flujo para agregar un nuevo combo de cuentas.\n"
+        "/combos - Muestra los combos disponibles para compra.\n"
+        "/verclientes - Muestra la lista de clientes con su ID y saldo.\n"
+        "/responder <ID> <mensaje> - Responde a reportes o envía mensajes a clientes.\n"
         "/eliminarcliente <ID> - Elimina un cliente del registro.\n"
        
     )
@@ -908,11 +885,11 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/comandos - Muestra esta lista.\n"
         "/stock - Ver el inventario detallado de cuentas.\n"
         "/addventa <Plataforma> - Iniciar el flujo para agregar una cuenta al stock.\n"
-        "/borrarventa - Iniciar el flujo para eliminar una cuenta del stock.\n"
+        "/borrarventa - Iniciar el flujo para eliminar una cuenta del stock o combos.\n"
         "/recargar <ID> <monto> - Recarga saldo a un usuario.\n"
         "/quitarsaldo <ID> <monto> - Descuenta saldo a un usuario.\n"
         "/consultarsaldo <ID> - Consulta el saldo de un usuario específico.\n"
-        "/historial - Obtén el CSV con el historial de tus compras.\n"
+        "/historial - Obtén el CSV con el historial de tus compras o para ver el de tus clientes /historial <id>.\n"
         "/cancel - Cancela un flujo de conversación (e.g., /addventa, /borrarventa o Reporte).\n"
         "/addcombo - Inicia el flujo para agregar un nuevo combo de cuentas.\n"
         "/combos - Muestra los combos disponibles para compra.\n"
@@ -1019,52 +996,217 @@ async def stock_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode="Markdown")
 
 def log_compra_global(user_id, plan, correo, password, precio, id_compra):
-    """Registra la compra en el archivo de historial global."""
+    """Registra la compra en el archivo de historial global.
+    Mantiene ID_Compra en la primera columna y usa 'Fecha de entrega' como nombre de columna.
+    """
     file_exists = os.path.exists(COMPRAS_FILE)
-    with open(COMPRAS_FILE, 'a', newline='') as f:
+    with open(COMPRAS_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists or os.path.getsize(COMPRAS_FILE) == 0:
-            writer.writerow(['ID_Compra', 'ID_Usuario', 'Fecha', 'Plan', 'Correo', 'Contraseña', 'Precio'])
-        
+            writer.writerow(['ID_Compra', 'ID_Usuario', 'Fecha de entrega', 'Plan', 'Correo', 'Contraseña', 'Precio'])
         fecha = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         writer.writerow([id_compra, user_id, fecha, plan, correo, password, f"{precio:.2f}"])
-    
     logging.info(f"Compra global registrada: {id_compra} para usuario {user_id}")
 
 def log_compra(user_id, plan, correo, password, precio, id_compra):
-    """Registra la compra del usuario en su archivo de historial."""
+    """Registra la compra del usuario en su archivo de historial con el orden:
+       Fecha de entrega, Plan, Correo, Contraseña, Precio, ID_Compra
+    """
     historial_file = f'historial_{user_id}.csv'
     fecha = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
+
     file_exists = os.path.exists(historial_file)
-    with open(historial_file, 'a', newline='') as f:
+    with open(historial_file, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists or os.path.getsize(historial_file) == 0:
-            writer.writerow(['ID_Compra', 'Fecha', 'Plan', 'Correo', 'Contraseña', 'Precio'])
-        
-        writer.writerow([id_compra, fecha, plan, correo, password, f"{precio:.2f}"])
-    
+            writer.writerow(['Fecha de entrega', 'Plan', 'Correo', 'Contraseña', 'Precio', 'ID_Compra'])
+        writer.writerow([fecha, plan, correo, password, f"{precio:.2f}", id_compra])
     logging.info(f"Compra registrada in historial_{user_id}.csv: {plan}")
-    
-    # También se registra en el historial global
+
+    # También registrar en el historial global
     log_compra_global(user_id, plan, correo, password, precio, id_compra)
 
+def validar_id_compra(user_id: int, id_compra: str) -> bool:
+    """Verifica si el ID de compra pertenece a user_id.
+    Busca tanto en COMPRAS_FILE (formato global) como en historial_{user}.csv (cualquier columna).
+    """
+    id_clean = _sanitize_id(id_compra)
+    if not id_clean:
+        logging.info("validar_id_compra: id vacío después de sanitizar.")
+        return False
+
+    script_dir = Path(__file__).resolve().parent
+    posibles_global = [Path(COMPRAS_FILE), script_dir / COMPRAS_FILE]
+    posibles_hist = [Path(f"historial_{user_id}.csv"), script_dir / f"historial_{user_id}.csv"]
+    encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+
+    def _read_csv_try(path: Path):
+        for enc in encodings_to_try:
+            try:
+                with path.open('r', newline='', encoding=enc) as f:
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader, start=1):
+                        yield enc, i, row
+                return
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                return
+        try:
+            with path.open('r', newline='', encoding=encodings_to_try[-1], errors='replace') as f:
+                reader = csv.reader(f)
+                for i, row in enumerate(reader, start=1):
+                    yield encodings_to_try[-1], i, row
+        except Exception:
+            return
+
+    # Buscar en archivo global (asume ID_Compra en col 0 y ID_Usuario en col 1)
+    for p in posibles_global:
+        try:
+            if not p.exists():
+                continue
+            for enc, i, row in _read_csv_try(p):
+                if not row:
+                    continue
+                first = (row[0] or "").strip().upper()
+                if i == 1 and first.startswith("ID"):
+                    continue
+                row_id_raw = row[0] if len(row) > 0 else ""
+                row_id = _sanitize_id(row_id_raw)
+                row_user = None
+                if len(row) > 1:
+                    try:
+                        row_user = int(str(row[1]).strip())
+                    except Exception:
+                        row_user = None
+                if row_id == id_clean and row_user == user_id:
+                    logging.info(f"validar_id_compra: encontrado en {p} -> {row}")
+                    return True
+        except Exception:
+            logging.exception(f"validar_id_compra: error leyendo {p}")
+
+    # Buscar en historial por usuario: la ID puede estar en cualquier columna
+    for p in posibles_hist:
+        try:
+            if not p.exists():
+                continue
+            for enc, i, row in _read_csv_try(p):
+                if not row:
+                    continue
+                for col in row:
+                    if _sanitize_id(col) == id_clean:
+                        logging.info(f"validar_id_compra: encontrado en historial {p} linea {i} -> {row}")
+                        return True
+        except Exception:
+            logging.exception(f"validar_id_compra: error leyendo historial {p}")
+
+    logging.info(f"validar_id_compra: ID {id_compra} no encontrado para user {user_id}")
+    return False
 
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/historial - Envía al usuario el archivo CSV con todas sus compras."""
-    user_id = update.message.from_user.id
-    historial_file = f'historial_{user_id}.csv'
-    
-    if os.path.exists(historial_file) and os.path.getsize(historial_file) > 0:
-        # Usar with para cerrar el archivo correctamente
-        with open(historial_file, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"historial_compras_{user_id}.csv",
-                caption="📂 Aquí tienes el historial de todas tus compras."
-            )
-    else:
-        await update.message.reply_text("❌ Aún no tienes compras registradas en tu historial.")
+    """/historial [ID] - Envía al usuario su historial o, si es admin y pasa ID, el historial de ese usuario.
+    Genera un CSV temporal con columnas ordenadas:
+      Fecha de entrega, Plan, Correo, Contraseña, Precio, ID_Compra
+    y filas ordenadas por fecha ascendente.
+    """
+    requester = update.message.from_user.id
+    target_id = requester
+    # admin puede pasar un ID
+    if is_admin(requester) and context.args and len(context.args) == 1:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ ID inválido. Uso: /historial <ID_USUARIO> (solo admin)")
+            return
+
+    historial_path = Path(f'historial_{target_id}.csv')
+    if not historial_path.exists() or historial_path.stat().st_size == 0:
+        if requester == target_id:
+            await update.message.reply_text("❌ Aún no tienes compras registradas en tu historial.")
+        else:
+            await update.message.reply_text(f"❌ El usuario `{target_id}` no tiene historial o el archivo no existe.", parse_mode="Markdown")
+        return
+
+    # Leer y parsear con fallback de encoding
+    rows = []
+    header = None
+    try:
+        with historial_path.open('r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for i, row in enumerate(reader):
+                if i == 0:
+                    header = row
+                else:
+                    rows.append(row)
+    except Exception:
+        with historial_path.open('r', newline='', encoding='latin-1', errors='replace') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            rows = list(reader)
+
+    def _index_of_any(hdr, candidates):
+        if not hdr:
+            return None
+        low = [c.lower().strip() for c in hdr]
+        for cand in candidates:
+            for j, val in enumerate(low):
+                if cand in val:
+                    return j
+        return None
+
+    fecha_idx = _index_of_any(header, ['fecha', 'fecha de entrega', 'date'])
+    plan_idx = _index_of_any(header, ['plan'])
+    correo_idx = _index_of_any(header, ['correo', 'email'])
+    pass_idx = _index_of_any(header, ['contraseña', 'password', 'pass'])
+    precio_idx = _index_of_any(header, ['precio', 'price'])
+    id_idx = _index_of_any(header, ['id_compra', 'id', 'id de compra'])
+
+    # Fallbacks por posiciones si no se encuentran
+    if header is None and rows:
+        if len(rows[0]) == 6:
+            fecha_idx, plan_idx, correo_idx, pass_idx, precio_idx, id_idx = range(6)
+
+    normalized = []
+    for r in rows:
+        def safe_get(idx):
+            return r[idx].strip() if idx is not None and idx < len(r) else ''
+        fecha_str = safe_get(fecha_idx) or safe_get(1) or safe_get(0)
+        plan = safe_get(plan_idx) or safe_get(2) or ''
+        correo = safe_get(correo_idx) or safe_get(3) or ''
+        passwd = safe_get(pass_idx) or safe_get(4) or ''
+        precio = safe_get(precio_idx) or safe_get(5) or ''
+        idc = safe_get(id_idx) or ''
+        fecha_obj = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
+            try:
+                fecha_obj = datetime.strptime(fecha_str, fmt)
+                break
+            except Exception:
+                continue
+        if fecha_obj is None:
+            fecha_obj = datetime.min
+        normalized.append((fecha_obj, fecha_str, plan, correo, passwd, precio, idc))
+
+    normalized.sort(key=lambda x: x[0])
+
+    # Crear CSV temporal ordenado
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.csv', prefix=f'historial_{target_id}_', mode='w', newline='', encoding='utf-8')
+    tmp_name = tmp.name
+    try:
+        with tmp:
+            writer = csv.writer(tmp)
+            writer.writerow(['Fecha de entrega', 'Plan', 'Correo', 'Contraseña', 'Precio', 'ID_Compra'])
+            for item in normalized:
+                fecha_str = item[1] or item[0].strftime('%Y-%m-%d %H:%M:%S')
+                writer.writerow([fecha_str, item[2], item[3], item[4], item[5], item[6]])
+
+        with open(tmp_name, 'rb') as f:
+            await update.message.reply_document(document=f, filename=f"historial_compras_{target_id}.csv", caption=f"📂 Historial de compras de {target_id}")
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
 
 def entregar_cuenta(plataforma: str, tipo: str, precio_buscado: float):
     """Entrega el siguiente perfil/disponible y actualiza el stock.
@@ -1131,29 +1273,59 @@ def entregar_cuenta(plataforma: str, tipo: str, precio_buscado: float):
 
 # --- Flujo de Borrado de Stock (Admin) ---
 
+
+# --- Nuevo/Modificado: gestión avanzada de /borrarventa (stock y combos) ---
+
 async def borrar_venta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/borrarventa - Muestra la lista de stock para eliminar (solo Admin)."""
-    user_id = update.effective_user.id
+    """/borrarventa - Muestra menú: borrar Stock (perfiles/completas) o gestionar Combos (eliminar/vaciar)."""
+    user_id = (update.effective_user.id if getattr(update, "effective_user", None)
+               else (update.message.from_user.id if getattr(update, "message", None) else None))
     if not is_admin(user_id):
-        if update.callback_query:
-             await update.callback_query.edit_message_text("❌ Solo el administrador puede borrar ventas.")
+        if getattr(update, "callback_query", None):
+            await update.callback_query.edit_message_text("❌ Solo el administrador puede borrar ventas.")
         else:
-             await update.message.reply_text("❌ Solo el administrador puede borrar ventas.")
+            await update.message.reply_text("❌ Solo el administrador puede borrar ventas.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("🗑️ Eliminar Perfiles / Completas", callback_data="borrar_stock")],
+        [InlineKeyboardButton("🗑️ Gestionar Combos (eliminar / vaciar)", callback_data="borrar_combos")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="empezar")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    texto = "🗑️ ¿Qué deseas eliminar?"
+    if getattr(update, "callback_query", None):
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+        try:
+            await update.callback_query.edit_message_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(chat_id=user_id, text=texto, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def borrar_stock_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra categorías de stock para eliminar (se llama desde el menú de borrar_venta)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Solo el administrador puede borrar stock.")
         return
 
     stock_list = load_stock()
     if not stock_list:
-        if update.callback_query:
-            await update.callback_query.edit_message_text("📦 El inventario está vacío. No hay nada para borrar.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]))
-        else:
-            await update.message.reply_text("📦 El inventario está vacío. No hay nada para borrar.")
+        await query.edit_message_text("📦 El inventario está vacío. No hay nada para borrar.",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="empezar")]]))
         return
-        
-    # Agrupar por tipo (Completa/Perfil) para facilitar la navegación
+
+    # Agrupar por categoría
     stock_by_category = defaultdict(list)
     for row in stock_list:
-        tipo_lower = row[1].lower()
-        # FIX: Categorización para borrado
+        tipo_lower = (row[1] if len(row) > 1 else "").lower()
         if 'completa' in tipo_lower and 'perfil' not in tipo_lower:
             stock_by_category['completa'].append(row)
         elif 'perfil' in tipo_lower:
@@ -1161,7 +1333,7 @@ async def borrar_venta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             stock_by_category['otro'].append(row)
 
-    context.user_data['stock_to_delete'] = stock_list # Guardamos la lista completa para referencia
+    context.user_data['stock_to_delete'] = stock_list
 
     keyboard = []
     if stock_by_category['completa']:
@@ -1169,59 +1341,109 @@ async def borrar_venta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stock_by_category['perfil']:
         keyboard.append([InlineKeyboardButton(f"👥 Cuentas por Perfil ({len(stock_by_category['perfil'])})", callback_data="borrar_perfil")])
     if stock_by_category['otro']:
-         keyboard.append([InlineKeyboardButton(f"❓ Otros Tipos ({len(stock_by_category['otro'])})", callback_data="borrar_otro")])
+        keyboard.append([InlineKeyboardButton(f"❓ Otros Tipos ({len(stock_by_category['otro'])})", callback_data="borrar_otro")])
 
-    keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="empezar")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    message = "🗑️ Selecciona la categoría de stock que deseas eliminar: "
+    keyboard.append([InlineKeyboardButton("⬅️ Volver", callback_data="borrar_venta_menu")])
+    await query.edit_message_text("🗑️ Selecciona la categoría de stock que deseas eliminar:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message, 
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            message, 
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
 
-async def mostrar_lista_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la lista de stock filtrada por categoría."""
+async def borrar_combos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra opciones para gestionar combos: listar/eliminar individual o vaciar todos."""
     query = update.callback_query
     await query.answer()
-
-    data = query.data.replace('borrar_', '') # 'completa', 'perfil', 'otro'
-    stock_list = context.user_data.get('stock_to_delete')
-    
-    if not stock_list:
-        await query.edit_message_text("❌ Error: Stock no encontrado en la sesión. Usa /borrarventa de nuevo.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]]))
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Solo el administrador puede borrar combos.")
         return
-        
+
+    if not combos:
+        await query.edit_message_text("❌ No hay combos definidos actualmente.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="borrar_venta_menu")]]))
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("🗑️ Eliminar combo individual", callback_data="borrar_combo_list")],
+        [InlineKeyboardButton("🧹 Vaciar todos los combos", callback_data="vaciar_combos")],
+        [InlineKeyboardButton("⬅️ Volver", callback_data="borrar_venta_menu")]
+    ]
+    await query.edit_message_text("🗂️ Gestión de Combos:\n\nElige una acción:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def borrar_combo_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista combos y espera número para eliminar uno (admin)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Solo el administrador puede eliminar combos.")
+        return
+
+    if not combos:
+        await query.edit_message_text("❌ No hay combos para eliminar.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="borrar_combos")]]))
+        return
+
+    mensaje = "🗑️ *Combos Disponibles para Eliminar:*\n\n"
+    for i, c in enumerate(combos):
+        plataformas = ", ".join(c.get('plataformas', [])) if c.get('plataformas') else "(no definidas)"
+        mensaje += f"{i+1}. *{c.get('titulo','Sin título')}* ({c.get('subnombre','')}) - ${float(c.get('precio',0.0)):.2f}\n   Plataformas: {plataformas}\n\n"
+    mensaje += f"👉 Envía el número (1 a {len(combos)}) del combo que deseas eliminar, o /cancel."
+
+    # Guardar copia y marcar estado
+    context.user_data['combo_list_for_delete'] = combos[:]  # copia de seguridad
+    context.user_data['awaiting_delete_combo_index'] = True
+
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="borrar_combos")]])
+    await query.edit_message_text(mensaje, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def vaciar_combos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vacía la lista de combos (admin)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Solo el administrador puede vaciar combos.")
+        return
+
+    combos.clear()
+    save_combos_csv()
+    await query.edit_message_text("✅ Se han eliminado todos los combos (lista vaciada).", parse_mode="Markdown")
+
+async def mostrar_lista_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la lista de stock filtrada por categoría (callback 'borrar_{completa|perfil|otro}')."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data.replace('borrar_', '')  # 'completa'|'perfil'|'otro'
+    stock_list = context.user_data.get('stock_to_delete')
+
+    if not stock_list:
+        await query.edit_message_text(
+            "❌ Error: Stock no encontrado en la sesión. Usa /borrarventa de nuevo.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="empezar")]])
+        )
+        return
+
     filtered_stock = []
     for row in stock_list:
-        if len(row) < 2:
+        if not row or len(row) < 2:
             continue
-        tipo = row[1].lower()
-        if (data == 'completa' and 'completa' in tipo and 'perfil' not in tipo):
+        tipo = (row[1] or "").lower()
+        if data == 'completa' and 'completa' in tipo and 'perfil' not in tipo:
             filtered_stock.append(row)
-        elif (data == 'perfil' and 'perfil' in tipo):
+        elif data == 'perfil' and 'perfil' in tipo:
             filtered_stock.append(row)
-        elif (data == 'otro' and 'completa' not in tipo and 'perfil' not in tipo):
+        elif data == 'otro' and 'completa' not in tipo and 'perfil' not in tipo:
             filtered_stock.append(row)
 
     if not filtered_stock:
-        await query.edit_message_text(f"❌ No hay stock de tipo '{data}' para eliminar.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="borrar_venta_menu")]]))
+        await query.edit_message_text(
+            f"❌ No hay stock de tipo '{data}' para eliminar.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="borrar_venta_menu")]])
+        )
         return
 
     context.user_data['filtered_stock'] = filtered_stock
-    
+
     message = f"🗑️ Stock Disponible para Borrar ({data.capitalize()}):\n\n"
-    
     for i, row in enumerate(filtered_stock):
         platform = row[0] if len(row) > 0 else 'N/A'
         tipo = row[1] if len(row) > 1 else 'N/A'
@@ -1232,35 +1454,74 @@ async def mostrar_lista_borrar(update: Update, context: ContextTypes.DEFAULT_TYP
         except (ValueError, TypeError):
             precio_f = 0.0
         message += f"{i+1}. {platform} ({tipo}) - ${precio_f:.2f} - Correo: {correo}\n"
-        
+
     message += f"\n👉 Envía el número (1 a {len(filtered_stock)}) de la cuenta que deseas eliminar, o /cancel."
-    
+
     keyboard = [[InlineKeyboardButton("⬅️ Volver a Categorías", callback_data="borrar_venta_menu")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        message, 
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
+
+    await query.edit_message_text(message, reply_markup=reply_markup, parse_mode="Markdown")
     context.user_data['awaiting_delete_index'] = True
 
+
+# Modificar borrar_stock_por_indice para manejar también eliminación de combos cuando corresponde
 async def borrar_stock_por_indice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja la eliminación del stock seleccionada por índice (Message Handler)."""
+    """Maneja la eliminación por índice tanto para stock como para combos (admin)."""
     user_id = update.message.from_user.id
-    
-    # 1. Verificar si estamos esperando un índice
-    if not context.user_data.get('awaiting_delete_index') or not is_admin(user_id):
-        return 
+    if not is_admin(user_id):
+        return
+
+    text = update.message.text.strip()
+
+    # 1) ¿Estamos en flujo de eliminación de combos?
+    if context.user_data.get('awaiting_delete_combo_index'):
+        try:
+            idx = int(text) - 1
+        except ValueError:
+            await update.message.reply_text("❌ Por favor ingresa un número válido.")
+            return
+
+        combo_list = context.user_data.get('combo_list_for_delete', [])
+        if not combo_list:
+            await update.message.reply_text("❌ Sesión de eliminación de combos expirada. Inicia de nuevo con /borrarventa.")
+            context.user_data.pop('awaiting_delete_combo_index', None)
+            context.user_data.pop('combo_list_for_delete', None)
+            return
+
+        if idx < 0 or idx >= len(combo_list):
+            await update.message.reply_text(f"❌ Número fuera de rango. Debe ser entre 1 y {len(combo_list)}.")
+            return
+
+        target = combo_list[idx]
+        removed = False
+        for i, c in enumerate(combos):
+            if c == target:
+                del combos[i]
+                removed = True
+                break
+
+        if removed:
+            save_combos_csv()
+            await update.message.reply_text(f"✅ Combo eliminado: *{target.get('titulo','Sin título')}*.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Error: no se pudo encontrar el combo exacto. La lista pudo cambiar. Intenta de nuevo.")
+
+        # limpiar estado
+        context.user_data.pop('awaiting_delete_combo_index', None)
+        context.user_data.pop('combo_list_for_delete', None)
+        return
+
+    # 2) Flujo original: eliminación de stock por índice
+    if not context.user_data.get('awaiting_delete_index'):
+        return
 
     try:
-        index_to_delete = int(update.message.text.strip()) - 1
+        index_to_delete = int(text) - 1
     except ValueError:
         await update.message.reply_text("❌ Por favor, ingresa un número válido.")
-        return 
+        return
 
     filtered_stock = context.user_data.get('filtered_stock')
-
     if not filtered_stock:
         await update.message.reply_text("❌ Error en la sesión de borrado. Usa /borrarventa para empezar de nuevo.")
         context.user_data.pop('awaiting_delete_index', None)
@@ -1268,25 +1529,22 @@ async def borrar_stock_por_indice(update: Update, context: ContextTypes.DEFAULT_
 
     if index_to_delete < 0 or index_to_delete >= len(filtered_stock):
         await update.message.reply_text(f"❌ Número fuera de rango. Debe ser entre 1 y {len(filtered_stock)}.")
-        return 
+        return
 
-    # 2. Obtener la cuenta a eliminar y buscar en la lista completa
     item_to_delete = filtered_stock[index_to_delete]
     all_stock = load_stock()
     found = False
-    
-    # Buscamos y eliminamos la primera ocurrencia que coincida exactamente (todos los campos)
     for i, row in enumerate(all_stock):
-        if row == item_to_delete: 
+        if row == item_to_delete:
             del all_stock[i]
             found = True
             break
-            
-    # 3. Guardar la cuenta eliminada en el archivo de stock
+
     if found:
-        platform, tipo, correo, _, precio = item_to_delete
+        platform = item_to_delete[0] if len(item_to_delete) > 0 else ''
+        tipo = item_to_delete[1] if len(item_to_delete) > 1 else ''
+        correo = item_to_delete[2] if len(item_to_delete) > 2 else ''
         save_stock(all_stock)
-        
         await update.message.reply_text(
             f"✅ Cuenta eliminada:\n*{platform}* ({tipo}) - Correo: {correo}\n\nUsa /borrarventa para seguir eliminando o /start para ir al menú principal.",
             parse_mode="Markdown"
@@ -1297,7 +1555,7 @@ async def borrar_stock_por_indice(update: Update, context: ContextTypes.DEFAULT_
             parse_mode="Markdown"
         )
 
-    # 4. Limpiar el estado de la conversación
+    # limpiar estado
     context.user_data.pop('awaiting_delete_index', None)
     context.user_data.pop('filtered_stock', None)
     context.user_data.pop('stock_to_delete', None)
@@ -1578,12 +1836,9 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
     logging.info(f"Entrega preparada: cuenta_data={cuenta_data}, user_id={user_id}, precio={precio_final:.2f}, saldo_restante={remaining:.2f}, id_compra={id_compra}")
 
     # Perfil / dispositivos
-    # Para cuentas completas queremos mostrar que se entregaron "Todos los perfiles"
-    # y que el cliente obtiene "1 dispositivo por perfil". Para cuentas por perfil
-    # mantenemos el comportamiento anterior.
     if perfil_entregado == 0:
-        perfil_text = "Todos los perfiles"
-        dispositivos_text = "1 dispositivo por perfil"
+        perfil_text = "Cuenta Completa"
+        dispositivos_text = "Todos los dispositivos"
     else:
         perfil_text = f"Perfil {perfil_entregado}"
         dispositivos_text = "1 dispositivo"
@@ -1594,7 +1849,7 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"➡️ Plataforma: {platform}\n"
         f"➡️ Correo: {correo}\n"
         f"➡️ Contraseña: {password}\n"
-        f"➡️ Perfiles asignados: {perfil_text}\n"
+        f"➡️ Perfil asignado: {perfil_text}\n"
         f"➡️ Dispositivos: {dispositivos_text}\n"
         f"➡️ Costo: ${precio_final:.2f}\n"
         "--------------------------------------\n"
@@ -1636,7 +1891,6 @@ async def handle_compra_final(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 5. Abrir automáticamente el menú principal (NUEVO MENSAJE)
     await show_main_menu(update, context, welcome_msg="✅ Compra exitosa. ¿Qué deseas hacer ahora?")
-
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, welcome_msg="Elige una opción:"):
     user = update.effective_user
     if not user:
@@ -2530,38 +2784,18 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     for entrega in entregados:
         plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
-        plan_lower = (plan_entregado or "").lower()
-        if 'perfil' in plan_lower and 'completa' not in plan_lower:
-            display_plan = 'perfil'
-        elif 'completa' in plan_lower and 'perfil' not in plan_lower:
-            display_plan = 'completa'
-        else:
-            display_plan = plan_entregado or 'otro'
+        # registrar incluyendo la plataforma en el plan para claridad en logs
+        log_compra(user_id, f"{combo.get('titulo','Combo')} - {plat_entregado} - {plan_entregado}", correo, password, precio_por_item, id_compra)
 
-        # Ajuste: para cuentas completas mostrar "Todos los perfiles" y
-        # "1 dispositivo por perfil"; para perfiles individuales mantener "Perfil N" y "1 dispositivo".
-        if perfil_entregado == 0:
-            perfil_text = "Todos los perfiles"
-            dispositivos_text = "1 dispositivo por perfil"
-        else:
-            perfil_text = f"Perfil {perfil_entregado}"
-            dispositivos_text = "1 dispositivo"
-
-        mensaje += (
-            f"• {plat_entregado} — {display_plan} — {perfil_text}\n"
-            f"   Dispositivos: {dispositivos_text}\n"
-            f"   Correo: `{correo}`\n"
-            f"   Contraseña: `{password}`\n\n"
-        )
+    # Construir mensaje de entrega: mostrar cada ítem con perfil y dispositivos (sin mostrar "Tipo")
+    mensaje = (
+        f"🎉 ¡Compra del combo *{combo.get('titulo','Combo')}* realizada!\n"
+        f"🆔 ID de Compra: `{id_compra}`\n"
+        f"💲 Precio total: ${precio_combo:.2f}\n\n"
+        "📦 Cuentas entregadas:\n"
+    )
     for entrega in entregados:
         plat_entregado, plan_entregado, correo, password, _, perfil_entregado = entrega
-        plan_lower = (plan_entregado or "").lower()
-        if 'perfil' in plan_lower and 'completa' not in plan_lower:
-            display_plan = 'perfil'
-        elif 'completa' in plan_lower and 'perfil' not in plan_lower:
-            display_plan = 'completa'
-        else:
-            display_plan = plan_entregado or 'otro'
 
         if perfil_entregado == 0:
             perfil_text = "Cuenta Completa"
@@ -2571,7 +2805,7 @@ async def handle_comprar_combo(update: Update, context: ContextTypes.DEFAULT_TYP
             dispositivos_text = "1 dispositivo"
 
         mensaje += (
-            f"• {plat_entregado} — {display_plan} — {perfil_text}\n"
+            f"• {plat_entregado} — {perfil_text}\n"
             f"   Dispositivos: {dispositivos_text}\n"
             f"   Correo: `{correo}`\n"
             f"   Contraseña: `{password}`\n\n"
@@ -2739,14 +2973,6 @@ def main():
     """Configuración principal del bot y registro de handlers."""
     cargar_clientes()
     load_combos_csv()
-
-    # Eliminar webhook si existe (solo para polling, no afecta a webhooks en producción)
-    try:
-        Bot(TOKEN).delete_webhook()
-        logging.info("Webhook eliminado (si existía).")
-    except Exception as e:
-        logging.warning(f"No se pudo eliminar webhook: {e}")
-
     application = ApplicationBuilder().token(TOKEN).build()
 
 
@@ -2772,14 +2998,6 @@ def main():
     application.add_handler(CommandHandler("combos", show_combos_menu))
     application.add_handler(CommandHandler("verclientes", ver_clientes))
     ...
-    # Navegación y compra
-    application.add_handler(CallbackQueryHandler(show_combos_menu, pattern='^show_combos_menu$'))
-    application.add_handler(CallbackQueryHandler(show_categories, pattern='^show_categories$'))
-    application.add_handler(CallbackQueryHandler(show_plataformas, pattern='^category_(completa|perfil)$'))
-    application.add_handler(CallbackQueryHandler(handle_platform_selection, pattern='^select_(completa|perfil)_.*'))
-    application.add_handler(CallbackQueryHandler(handle_compra_final, pattern='^buy_.*'))
-    # Handler para comprar combos (cada botón produce comprar_combo_{i})
-    application.add_handler(CallbackQueryHandler(handle_comprar_combo, pattern=r'^comprar_combo_\d+$'))
 
     # Comandos admin
     application.add_handler(CommandHandler("stock", stock_check))
@@ -2789,13 +3007,14 @@ def main():
     application.add_handler(CommandHandler("responder", responder))
     application.add_handler(CommandHandler("eliminarcliente", eliminar_cliente))
     application.add_handler(CommandHandler("borrarventa", borrar_venta))
-
-        # Conversation handler: combos
+   
+   
+    # Conversation handler: combos (completa — incluye callbacks para botones)
     addcombo_handler = ConversationHandler(
         entry_points=[CommandHandler('addcombo', addcombo_start)],
         states={
             ADD_COMBO_TITULO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_titulo)],
-            ADD_COMBO_SUBNOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_subnombre)],  # CORRECCIÓN: nombre correcto
+            ADD_COMBO_SUBNOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_subnombre)],
             ADD_COMBO_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcombo_precio)],
             # En el estado de plataformas aceptamos texto y callbacks (botones de stock)
             ADD_COMBO_PLATAFORMAS: [
@@ -2826,14 +3045,16 @@ def main():
     addventa_handler = ConversationHandler(
         entry_points=[CommandHandler('addventa', addventa)],
         states={
-            AGREGAR_TIPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_tipo)],
-            AGREGAR_PERFILES: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_perfiles)],
-            AGREGAR_CORREO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_correo)],
-            AGREGAR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_pass)],
-            AGREGAR_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_precio)],
-            AGREGAR_MATERIAL: [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, guardar_material_perfil)],
+            AGREGAR_TIPO: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), venta_tipo)],
+            AGREGAR_PERFILES: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), venta_perfiles)],
+            AGREGAR_CORREO: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), venta_correo)],
+            AGREGAR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), venta_pass)],
+            AGREGAR_PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), venta_precio)],
+            AGREGAR_MATERIAL: [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & filters.User(ADMIN_ID), guardar_material_perfil)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
+        per_user=True,
+        per_chat=False,
     )
     application.add_handler(addventa_handler)
 
@@ -2850,11 +3071,20 @@ def main():
     # Volver al menú (botón "empezar")
     application.add_handler(CallbackQueryHandler(volver_al_menu_callback, pattern=r'^empezar$'))
 
-    # Borrado / respuestas admin
-    application.add_handler(CallbackQueryHandler(borrar_venta, pattern='^borrar_venta_menu$'))
-    application.add_handler(CallbackQueryHandler(mostrar_lista_borrar, pattern='^borrar_(completa|perfil|otro)$'))
-    application.add_handler(MessageHandler(filters.Regex(r'^\d+$') & filters.Chat(ADMIN_ID), borrar_stock_por_indice))
-    application.add_handler(MessageHandler(filters.PHOTO & filters.Chat(ADMIN_ID), responder_foto))
+        # Handlers para borrar (nuevo)
+    application.add_handler(CallbackQueryHandler(borrar_stock_menu_callback, pattern=r'^borrar_stock$'))
+    application.add_handler(CallbackQueryHandler(borrar_combos_callback, pattern=r'^borrar_combos$'))
+    application.add_handler(CallbackQueryHandler(borrar_combo_list_callback, pattern=r'^borrar_combo_list$'))
+    application.add_handler(CallbackQueryHandler(vaciar_combos_callback, pattern=r'^vaciar_combos$'))
+    # Registrar handler que muestra la lista filtrada de stock (completa/perfil/otro)
+    application.add_handler(CallbackQueryHandler(mostrar_lista_borrar, pattern=r'^borrar_(completa|perfil|otro)$'))
+    # Permitir volver al menú de borrado desde submenús
+    application.add_handler(CallbackQueryHandler(borrar_venta, pattern=r'^borrar_venta_menu$'))
+    # Registrar handler que recibe el número para eliminar (sólo admin)
+    application.add_handler(MessageHandler(filters.Regex(r'^\d+$') & filters.User(ADMIN_ID), borrar_stock_por_indice))
+    # (El handler que muestra categorías para borrar ya está: mostrar_lista_borrar -> pattern '^borrar_(completa|perfil|otro)$')
+    # El MessageHandler que espera números ya está registrado y ahora soporta combos y stock:
+    # application.add_handler(MessageHandler(filters.Regex(r'^\d+$') & filters.Chat(ADMIN_ID), borrar_stock_por_indice))
 
     # Ejecutar
     application.run_polling()
